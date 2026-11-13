@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import sqlite3
 from datetime import datetime, date, timedelta
 import pandas as pd
@@ -109,16 +110,56 @@ def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
 
     return OpenAI(base_url="http://127.0.0.1:1337/v1", api_key="not-needed"), "Qwen2.5-3B-Instruct-4bit", "Offline (Server Belum Aktif)"
 
-# --- 2. DATABASE SETUP, WAL & MULTI-WAREHOUSE MIGRATION ---
-conn = sqlite3.connect("jurnal_bins.db", timeout=15.0, check_same_thread=False)
-conn.execute("PRAGMA journal_mode=WAL;")
-conn.execute("PRAGMA synchronous=NORMAL;")
-conn.execute("PRAGMA temp_store=MEMORY;")
+# --- 2. LOCK-SAFE DATABASE SETUP (WAL + 30s BUSY TIMEOUT + CACHED CONNECTION) ---
+@st.cache_resource
+def get_db_connection() -> sqlite3.Connection:
+    c = sqlite3.connect("jurnal_bins.db", timeout=30.0, check_same_thread=False)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("PRAGMA busy_timeout=30000;")
+    c.execute("PRAGMA temp_store=MEMORY;")
+    return c
+
+conn = get_db_connection()
+
+def db_execute_safe(sql: str, params: tuple | list = (), commit: bool = True, retries: int = 6):
+    """Executes write statements with automatic exponential backoff if SQLite is momentarily busy."""
+    for attempt in range(retries):
+        try:
+            cur = conn.execute(sql, params)
+            if commit:
+                conn.commit()
+            return cur
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < retries - 1:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
+
+def db_executemany_safe(sql: str, seq_of_params: list, retries: int = 6):
+    for attempt in range(retries):
+        try:
+            cur = conn.executemany(sql, seq_of_params)
+            conn.commit()
+            return cur
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < retries - 1:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                time.sleep(0.15 * (attempt + 1))
+                continue
+            raise
 
 table_exists = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bin_map'").fetchone()
 
 if not table_exists:
-    conn.execute("""
+    db_execute_safe("""
         CREATE TABLE bin_map (
             warehouse TEXT DEFAULT 'Surabaya',
             jurnal_sku TEXT,
@@ -140,17 +181,17 @@ if not table_exists:
 else:
     existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(bin_map)").fetchall()]
     if "box_qty" not in existing_cols:
-        conn.execute("ALTER TABLE bin_map ADD COLUMN box_qty INTEGER DEFAULT 1")
+        db_execute_safe("ALTER TABLE bin_map ADD COLUMN box_qty INTEGER DEFAULT 1")
     if "pcs_per_box" not in existing_cols:
-        conn.execute("ALTER TABLE bin_map ADD COLUMN pcs_per_box INTEGER")
+        db_execute_safe("ALTER TABLE bin_map ADD COLUMN pcs_per_box INTEGER")
     if "min_box_threshold" not in existing_cols:
-        conn.execute("ALTER TABLE bin_map ADD COLUMN min_box_threshold INTEGER DEFAULT 3")
+        db_execute_safe("ALTER TABLE bin_map ADD COLUMN min_box_threshold INTEGER DEFAULT 3")
     if "expiry_date" not in existing_cols:
-        conn.execute("ALTER TABLE bin_map ADD COLUMN expiry_date TEXT")
+        db_execute_safe("ALTER TABLE bin_map ADD COLUMN expiry_date TEXT")
     if "picker_name" not in existing_cols:
-        conn.execute("ALTER TABLE bin_map ADD COLUMN picker_name TEXT")
+        db_execute_safe("ALTER TABLE bin_map ADD COLUMN picker_name TEXT")
     if "warehouse" not in existing_cols:
-        conn.execute("""
+        db_execute_safe("""
             CREATE TABLE bin_map_new (
                 warehouse TEXT DEFAULT 'Surabaya',
                 jurnal_sku TEXT,
@@ -169,7 +210,7 @@ else:
                 PRIMARY KEY (warehouse, jurnal_sku)
             )
         """)
-        conn.execute("""
+        db_execute_safe("""
             INSERT INTO bin_map_new (
                 warehouse, jurnal_sku, product_name, category, row_num, floor_num,
                 bin_location, turnover_speed, notes, box_qty, pcs_per_box,
@@ -181,15 +222,15 @@ else:
                 COALESCE(min_box_threshold, 3), expiry_date, picker_name
             FROM bin_map
         """)
-        conn.execute("DROP TABLE bin_map")
-        conn.execute("ALTER TABLE bin_map_new RENAME TO bin_map")
+        db_execute_safe("DROP TABLE bin_map")
+        db_execute_safe("ALTER TABLE bin_map_new RENAME TO bin_map")
 
-conn.execute("CREATE INDEX IF NOT EXISTS idx_wh_bin_location ON bin_map(warehouse, row_num, floor_num);")
-conn.execute("CREATE INDEX IF NOT EXISTS idx_product_name ON bin_map(product_name);")
-conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON bin_map(category);")
+db_execute_safe("CREATE INDEX IF NOT EXISTS idx_wh_bin_location ON bin_map(warehouse, row_num, floor_num);")
+db_execute_safe("CREATE INDEX IF NOT EXISTS idx_product_name ON bin_map(product_name);")
+db_execute_safe("CREATE INDEX IF NOT EXISTS idx_category ON bin_map(category);")
 
-# Sales / Outbound Velocity Table (Tracks sales per warehouse so AI learns demand)
-conn.execute("""
+# Sales / Outbound Velocity Table
+db_execute_safe("""
     CREATE TABLE IF NOT EXISTS outbound_sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         warehouse TEXT,
@@ -201,10 +242,10 @@ conn.execute("""
         actor TEXT
     )
 """)
-conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_wh_sku ON outbound_sales(warehouse, jurnal_sku, sale_date);")
+db_execute_safe("CREATE INDEX IF NOT EXISTS idx_sales_wh_sku ON outbound_sales(warehouse, jurnal_sku, sale_date);")
 
-# Inter-Location Stock Transfer Tracker Table (Surabaya <-> Jakarta <-> Toko Aneka)
-conn.execute("""
+# Inter-Location Stock Transfer Tracker Table
+db_execute_safe("""
     CREATE TABLE IF NOT EXISTS stock_transfers (
         transfer_id TEXT PRIMARY KEY,
         from_warehouse TEXT,
@@ -226,16 +267,15 @@ conn.execute("""
         courier_notes TEXT
     )
 """)
-# Safe migration for stock_transfers pre-assigned target bin columns
 tr_cols = [row[1] for row in conn.execute("PRAGMA table_info(stock_transfers)").fetchall()]
 if "target_row" not in tr_cols:
-    conn.execute("ALTER TABLE stock_transfers ADD COLUMN target_row INTEGER")
+    db_execute_safe("ALTER TABLE stock_transfers ADD COLUMN target_row INTEGER")
 if "target_floor" not in tr_cols:
-    conn.execute("ALTER TABLE stock_transfers ADD COLUMN target_floor INTEGER")
+    db_execute_safe("ALTER TABLE stock_transfers ADD COLUMN target_floor INTEGER")
 if "target_bin" not in tr_cols:
-    conn.execute("ALTER TABLE stock_transfers ADD COLUMN target_bin TEXT")
+    db_execute_safe("ALTER TABLE stock_transfers ADD COLUMN target_bin TEXT")
 
-conn.execute("""
+db_execute_safe("""
     CREATE TABLE IF NOT EXISTS warehouse_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         category TEXT,
@@ -243,7 +283,7 @@ conn.execute("""
         created_at TEXT
     )
 """)
-conn.execute("""
+db_execute_safe("""
     CREATE TABLE IF NOT EXISTS activity_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT,
@@ -254,18 +294,15 @@ conn.execute("""
 """)
 act_cols = [row[1] for row in conn.execute("PRAGMA table_info(activity_log)").fetchall()]
 if "actor" not in act_cols:
-    conn.execute("ALTER TABLE activity_log ADD COLUMN actor TEXT DEFAULT 'System'")
-
-conn.commit()
+    db_execute_safe("ALTER TABLE activity_log ADD COLUMN actor TEXT DEFAULT 'System'")
 
 def log_activity(action: str, details: str, actor: str | None = None):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     active_actor = actor if actor else st.session_state.get("current_user", "System")
-    conn.execute(
+    db_execute_safe(
         "INSERT INTO activity_log (timestamp, action, details, actor) VALUES (?, ?, ?, ?)",
         (now, action, details, active_actor)
     )
-    conn.commit()
 
 def get_loc_code(loc_name: str) -> str:
     codes = {
@@ -612,10 +649,6 @@ def auto_assign_bin(
 def preassign_destination_bin(
     dest_wh: str, sku: str, name: str, cat: str, speed: str, box_qty: int, pcs_per_box: int | None
 ) -> tuple[int, int, str, str]:
-    """
-    Determines the exact rack slot in the destination warehouse (Surabaya or Jakarta)
-    the moment a transfer is dispatched, so it is auto-inputted and ready for final check.
-    """
     existing = conn.execute(
         "SELECT row_num, floor_num, bin_location FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?",
         (dest_wh, sku)
@@ -675,11 +708,10 @@ def render_warehouse_input_form(warehouse_name: str):
                         st.error(f"Gagal: {msg}")
                     else:
                         b_code = f"R{ar:02d}-L{af}"
-                        conn.execute("""INSERT OR REPLACE INTO bin_map 
+                        db_execute_safe("""INSERT OR REPLACE INTO bin_map 
                             (warehouse, jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold, expiry_date)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (warehouse_name, sku.strip(), name.strip(), cat.strip(), ar, af, b_code, speed, notes.strip(), int(box_qty), pcs_val, int(min_thresh), exp_str))
-                        conn.commit()
                         log_activity("AUTO_ASSIGN", f"[{warehouse_name}] {sku.strip()} -> {b_code}")
                         st.success(f"Berhasil Auto-Assign `{sku.strip()}` → **{warehouse_name} | {b_code}** ({msg})")
                 else:
@@ -697,11 +729,10 @@ def render_warehouse_input_form(warehouse_name: str):
                         with st.spinner("AI menganalisis alasan override..."):
                             r_ok, ai_fb = evaluate_override_reason_with_ai(warehouse_name, sku.strip(), name.strip(), cat.strip(), row_num, floor_num, speed, notes.strip(), int(box_qty), pcs_val, blk_msg, override_reason.strip())
                         if r_ok:
-                            conn.execute("""INSERT OR REPLACE INTO bin_map 
+                            db_execute_safe("""INSERT OR REPLACE INTO bin_map 
                                 (warehouse, jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold, expiry_date)
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                 (warehouse_name, sku.strip(), name.strip(), cat.strip(), row_num, floor_num, b_code, speed, notes.strip(), int(box_qty), pcs_val, int(min_thresh), exp_str))
-                            conn.commit()
                             log_activity("OVERRIDE_APPROVED", f"[{warehouse_name}] {sku.strip()} ke {b_code}")
                             st.success(f"Override Disetujui AI: `{sku.strip()}` → **{warehouse_name} | {b_code}**\n\n**Audit AI:** {ai_fb}")
                         else:
@@ -714,11 +745,10 @@ def render_warehouse_input_form(warehouse_name: str):
                                 "override_reason": override_reason.strip(), "ai_feedback": ai_fb
                             }
                     else:
-                        conn.execute("""INSERT OR REPLACE INTO bin_map 
+                        db_execute_safe("""INSERT OR REPLACE INTO bin_map 
                             (warehouse, jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold, expiry_date)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (warehouse_name, sku.strip(), name.strip(), cat.strip(), row_num, floor_num, b_code, speed, notes.strip(), int(box_qty), pcs_val, int(min_thresh), exp_str))
-                        conn.commit()
                         log_activity("SIMPAN_RAK", f"[{warehouse_name}] {sku.strip()} -> {b_code}")
                         st.success(f"Berhasil menyimpan: `{sku.strip()}` → **{warehouse_name} | {b_code}**")
 
@@ -727,11 +757,10 @@ def render_warehouse_input_form(warehouse_name: str):
         st.error(f"⚠️ **Audit AI ({warehouse_name}): Kurang Masuk Akal**\n\n{pfo['ai_feedback']}")
         fc1, fc2 = st.columns(2)
         if fc1.button(f"🔓 Tetap Paksa Simpan ({warehouse_name})", type="primary", key=f"force_btn_{wh_key}"):
-            conn.execute("""INSERT OR REPLACE INTO bin_map 
+            db_execute_safe("""INSERT OR REPLACE INTO bin_map 
                 (warehouse, jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold, expiry_date)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (pfo["warehouse"], pfo["sku"], pfo["name"], pfo["cat"], pfo["row_num"], pfo["floor_num"], pfo["bin_code"], pfo["speed"], pfo["notes"], pfo["box_qty"], pfo["pcs_val"], pfo["min_thresh"], pfo["exp_str"]))
-            conn.commit()
             log_activity("FORCE_OVERRIDE", f"[{pfo['warehouse']}] Force save {pfo['sku']} to {pfo['bin_code']}")
             st.session_state.pending_force_override = None
             st.success("Tersimpan dengan Force Override.")
@@ -740,7 +769,7 @@ def render_warehouse_input_form(warehouse_name: str):
             st.session_state.pending_force_override = None
             st.rerun()
 
-# --- HELPER RENDERER FOR 8x6 WAREHOUSE MAP (INCLUDES PRE-ASSIGNED IN-TRANSIT) ---
+# --- HELPER RENDERER FOR 8x6 WAREHOUSE MAP ---
 def render_warehouse_grid(warehouse_name: str):
     agg_df = pd.read_sql_query(
         "SELECT row_num, floor_num, COUNT(*) AS sku_cnt, COALESCE(SUM(box_qty), 0) AS total_dus FROM bin_map WHERE warehouse = ? GROUP BY row_num, floor_num",
@@ -748,7 +777,6 @@ def render_warehouse_grid(warehouse_name: str):
     )
     slot_lookup = {(int(r["row_num"]), int(r["floor_num"])): (int(r["sku_cnt"]), int(r["total_dus"])) for _, r in agg_df.iterrows()}
 
-    # Also show pre-assigned In-Transit incoming boxes reserved on each slot
     incoming_df = pd.read_sql_query(
         "SELECT target_row, target_floor, COALESCE(SUM(box_qty), 0) AS incoming_dus FROM stock_transfers WHERE to_warehouse = ? AND status = 'In-Transit' AND target_row IS NOT NULL GROUP BY target_row, target_floor",
         conn, params=[warehouse_name]
@@ -864,10 +892,9 @@ with tab2:
         if discrepancies and st.button(f"📝 Koreksi & Sinkronkan Stok Opname ({audit_wh})"):
             for sku_id, sys_q, phys_q, b_loc in discrepancies:
                 if phys_q == 0:
-                    conn.execute("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (audit_wh, sku_id))
+                    db_execute_safe("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (audit_wh, sku_id))
                 else:
-                    conn.execute("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (phys_q, audit_wh, sku_id))
-            conn.commit()
+                    db_execute_safe("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (phys_q, audit_wh, sku_id))
             log_activity("CYCLE_COUNT_AUDIT", f"[{audit_wh}] Audit Baris {audit_row:02d} disinkronkan. Koreksi {len(discrepancies)} item.")
             st.success(f"Stok opname Gudang {audit_wh} berhasil disinkronkan!")
             st.rerun()
@@ -933,16 +960,15 @@ with tab4:
                 for it in picked_items:
                     rem = it["avail"] - it["ambil"]
                     if rem <= 0:
-                        conn.execute("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (pick_wh, it["sku"]))
+                        db_execute_safe("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (pick_wh, it["sku"]))
                     else:
-                        conn.execute("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (rem, pick_wh, it["sku"]))
+                        db_execute_safe("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (rem, pick_wh, it["sku"]))
                     
-                    conn.execute("""
+                    db_execute_safe("""
                         INSERT INTO outbound_sales (warehouse, jurnal_sku, product_name, boxes_sold, sale_date, invoice_no, actor)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (pick_wh, it["sku"], it["name"], int(it["ambil"]), now_str, inv_no, picker))
                 
-                conn.commit()
                 log_activity("PICKING", f"[{pick_wh}] Picking {inv_no} oleh {picker} untuk {len(picked_items)} SKU", actor=picker)
                 st.success(f"Surat Jalan **{inv_no}** ({pick_wh}) berhasil diterbitkan! Data penjualan otomatis direkam untuk analisis AI.")
 
@@ -961,7 +987,7 @@ with tab5:
     st.divider()
     col_tr1, col_tr2 = st.columns([1.15, 1.85])
 
-    # LEFT: Create New Transfer Shipment (Auto-Input Destination Bin Immediately)
+    # LEFT: Create New Transfer Shipment
     with col_tr1:
         st.markdown("#### 📤 Buat Pengiriman / Transfer Baru")
         origin_loc = st.selectbox("Lokasi Pengirim", TRANSFER_LOCATIONS, key="tr_origin")
@@ -988,17 +1014,9 @@ with tab5:
                     if st.form_submit_button(f"🚚 Kirim & Auto-Input ke {dest_loc}", use_container_width=True):
                         tr_id = f"TRF-{get_loc_code(origin_loc)}-{get_loc_code(dest_loc)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                         now_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        
-                        # Deduct from origin warehouse
-                        rem_origin = int(chosen_row["box_qty"]) - int(tr_qty)
-                        if rem_origin <= 0:
-                            conn.execute("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (origin_loc, chosen_row["jurnal_sku"]))
-                        else:
-                            conn.execute("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (rem_origin, origin_loc, chosen_row["jurnal_sku"]))
-                        
                         pcs_box_val = int(chosen_row["pcs_per_box"]) if pd.notna(chosen_row["pcs_per_box"]) else None
 
-                        # Auto-input target rack slot if destination is Surabaya or Jakarta
+                        # 1. Pre-assign destination bin FIRST (pure read, no write lock held yet)
                         if dest_loc in WAREHOUSES:
                             t_row, t_floor, t_bin, _ = preassign_destination_bin(
                                 dest_loc, chosen_row["jurnal_sku"], chosen_row["product_name"],
@@ -1008,7 +1026,15 @@ with tab5:
                         else:
                             t_row, t_floor, t_bin = None, None, "Toko Aneka (Retail)"
 
-                        conn.execute("""
+                        # 2. Deduct from origin warehouse with safe commit
+                        rem_origin = int(chosen_row["box_qty"]) - int(tr_qty)
+                        if rem_origin <= 0:
+                            db_execute_safe("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (origin_loc, chosen_row["jurnal_sku"]))
+                        else:
+                            db_execute_safe("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (rem_origin, origin_loc, chosen_row["jurnal_sku"]))
+
+                        # 3. Record transfer shipment
+                        db_execute_safe("""
                             INSERT INTO stock_transfers (
                                 transfer_id, from_warehouse, to_warehouse, jurnal_sku, product_name,
                                 category, turnover_speed, box_qty, pcs_per_box, target_row, target_floor, target_bin,
@@ -1019,7 +1045,6 @@ with tab5:
                             chosen_row["category"], chosen_row["turnover_speed"], int(tr_qty), pcs_box_val,
                             t_row, t_floor, t_bin, now_ts, st.session_state.current_user, courier_info.strip()
                         ))
-                        conn.commit()
                         log_activity("TRANSFER_SENT", f"{tr_id}: {tr_qty} dus {chosen_row['jurnal_sku']} ({origin_loc} -> {dest_loc} | Auto-Slot: {t_bin})")
                         st.success(f"Dikirim (**{tr_id}**)! Sistem otomatis menyiapkan slot **{dest_loc} | {t_bin}** untuk Final Check.")
                         st.rerun()
@@ -1043,7 +1068,7 @@ with tab5:
                             dest_loc, ank_sku.strip(), ank_name.strip() or ank_sku.strip(),
                             "Toko Aneka", ank_speed, int(ank_qty), None
                         )
-                        conn.execute("""
+                        db_execute_safe("""
                             INSERT INTO stock_transfers (
                                 transfer_id, from_warehouse, to_warehouse, jurnal_sku, product_name,
                                 category, turnover_speed, box_qty, pcs_per_box, target_row, target_floor, target_bin,
@@ -1053,7 +1078,6 @@ with tab5:
                             tr_id, dest_loc, ank_sku.strip(), ank_name.strip() or ank_sku.strip(),
                             ank_speed, int(ank_qty), t_row, t_floor, t_bin, now_ts, st.session_state.current_user, courier_info.strip()
                         ))
-                        conn.commit()
                         log_activity("TRANSFER_SENT", f"{tr_id}: {ank_qty} dus {ank_sku.strip()} (Toko Aneka -> {dest_loc} | Auto-Slot: {t_bin})")
                         st.success(f"Dikirim (**{tr_id}**)! Sistem otomatis menyiapkan slot **{dest_loc} | {t_bin}** untuk Final Check.")
                         st.rerun()
@@ -1086,12 +1110,11 @@ with tab5:
                         if dest == "Toko Aneka":
                             if st.button("✅ Final Check Toko Aneka", key=f"rcv_{tr['transfer_id']}", type="primary", use_container_width=True):
                                 now_rcv = datetime.now().strftime("%Y-%m-%d %H:%M")
-                                conn.execute("""
+                                db_execute_safe("""
                                     UPDATE stock_transfers
                                     SET status = 'Completed', received_at = ?, receiver = ?
                                     WHERE transfer_id = ?
                                 """, (now_rcv, st.session_state.current_user, tr["transfer_id"]))
-                                conn.commit()
                                 log_activity("TRANSFER_RECEIVED", f"{tr['transfer_id']} Final Check selesai di Toko Aneka ({expected_boxes} dus {tr['jurnal_sku']})")
                                 st.success("Final Check Toko Aneka selesai!")
                                 st.rerun()
@@ -1116,7 +1139,7 @@ with tab5:
 
                                     if existing_dest:
                                         new_total = int(existing_dest[3]) + int(verified_qty)
-                                        conn.execute(
+                                        db_execute_safe(
                                             "UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?",
                                             (new_total, dest, sku_t)
                                         )
@@ -1131,7 +1154,7 @@ with tab5:
                                                 tr["turnover_speed"] or "Medium (Normal)", int(verified_qty), pcs_v
                                             )
                                         final_bin = f"R{ar:02d}-L{af}"
-                                        conn.execute("""
+                                        db_execute_safe("""
                                             INSERT INTO bin_map (
                                                 warehouse, jurnal_sku, product_name, category, row_num, floor_num,
                                                 bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold
@@ -1144,12 +1167,11 @@ with tab5:
                                 else:
                                     final_bin = pre_bin
 
-                                conn.execute("""
+                                db_execute_safe("""
                                     UPDATE stock_transfers
                                     SET status = 'Completed', box_qty = ?, received_at = ?, receiver = ?
                                     WHERE transfer_id = ?
                                 """, (int(verified_qty), now_rcv, st.session_state.current_user, tr["transfer_id"]))
-                                conn.commit()
 
                                 if diff == 0:
                                     log_activity("TRANSFER_RECEIVED", f"{tr['transfer_id']} Final Check OK ({verified_qty} dus) -> {dest} | {final_bin}")
@@ -1263,11 +1285,10 @@ with tab8:
                     3,
                     None
                 ))
-            conn.executemany(
+            db_executemany_safe(
                 "INSERT OR REPLACE INTO bin_map (warehouse, jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold, expiry_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 records
             )
-            conn.commit()
             log_activity("IMPORT_MASSAL", f"Import {len(records)} SKU")
             st.success(f"Berhasil mengimpor {len(records)} SKU!")
 
