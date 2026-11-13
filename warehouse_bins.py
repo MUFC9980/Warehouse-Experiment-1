@@ -401,7 +401,7 @@ def get_memory_context() -> str:
         conn
     )
     log_df = pd.read_sql_query(
-        "SELECT timestamp, action, details FROM activity_log ORDER BY id DESC LIMIT 10",
+        "SELECT timestamp, actor, action, details FROM activity_log ORDER BY id DESC LIMIT 10",
         conn
     )
     parts = []
@@ -409,7 +409,7 @@ def get_memory_context() -> str:
         rules = "\n".join([f"- [{r['category']}] {r['memory_text']}" for _, r in mem_df.iterrows()])
         parts.append(f"ATURAN & MEMORI TETAP GUDANG:\n{rules}")
     if not log_df.empty:
-        logs = "\n".join([f"- {r['timestamp']} | {r['action']}: {r['details']}" for _, r in log_df.iterrows()])
+        logs = "\n".join([f"- {r['timestamp']} | {r['actor']} | {r['action']}: {r['details']}" for _, r in log_df.iterrows()])
         parts.append(f"RIWAYAT AKTIVITAS TERAKHIR:\n{logs}")
     return "\n\n".join(parts) if parts else "Belum ada memori khusus tambahan."
 
@@ -760,7 +760,7 @@ if "tab6_unlocked" not in st.session_state:
 if "pending_force_override" not in st.session_state:
     st.session_state.pending_force_override = None
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "1. Input & Zonasi",
     "2. Peta Rak & Audit",
     "3. Asisten AI",
@@ -769,7 +769,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "6. Reorder & Demand ⚠️",
     "7. FIFO & Expiry ⏳",
     "8. Import Excel",
-    "9. 🔒 Memori & Leaderboard"
+    "9. 🔒 Memori & Leaderboard",
+    "10. 🔔 Notifikasi & Log Staf"
 ])
 
 # --- TAB 1: INPUT & PEMETAAN RAK (SURABAYA & JAKARTA ONLY) ---
@@ -909,7 +910,6 @@ with tab5:
     st.subheader("🚚 Tracker Pengiriman Antar Gudang & Toko (Surabaya ↔ Jakarta ↔ Toko Aneka)")
     st.caption("Catatan: **Toko Aneka** beroperasi sebagai toko retail ringan (hanya mencatat pengiriman keluar/masuk tanpa sistem peta rak 8×6).")
 
-    # Show AI Smart Transfer Banner if Jakarta needs restocking from Surabaya
     smart_recs = compute_jakarta_transfer_recommendations()
     if not smart_recs.empty:
         transferable = smart_recs[smart_recs["Saran Transfer"] > 0]
@@ -927,7 +927,7 @@ with tab5:
         dest_options = [loc for loc in TRANSFER_LOCATIONS if loc != origin_loc]
         dest_loc = st.selectbox("Lokasi Tujuan", dest_options, key="tr_dest")
 
-        # Case A: Origin is Surabaya or Jakarta (Pulls from 8x6 bin_map inventory)
+        # Case A: Origin is Surabaya or Jakarta
         if origin_loc in WAREHOUSES:
             avail_df = pd.read_sql_query(
                 "SELECT jurnal_sku, product_name, category, turnover_speed, bin_location, box_qty, pcs_per_box FROM bin_map WHERE warehouse = ? AND box_qty > 0 ORDER BY jurnal_sku",
@@ -970,7 +970,7 @@ with tab5:
                         st.success(f"Pengiriman **{tr_id}** tercatat In-Transit ke **{dest_loc}**!")
                         st.rerun()
 
-        # Case B: Origin is Toko Aneka (Lightweight return/transfer log without 8x6 rack deduction)
+        # Case B: Origin is Toko Aneka
         else:
             st.caption("Catat pengiriman/retur barang dari **Toko Aneka** menuju gudang utama:")
             with st.form("create_transfer_aneka_form"):
@@ -1023,7 +1023,6 @@ with tab5:
                             add_boxes = int(tr["box_qty"])
                             now_rcv = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-                            # If destination is Toko Aneka, log completion directly without 8x6 rack assignment
                             if dest == "Toko Aneka":
                                 conn.execute("""
                                     UPDATE stock_transfers
@@ -1034,8 +1033,6 @@ with tab5:
                                 log_activity("TRANSFER_RECEIVED", f"{tr['transfer_id']} diterima di Toko Aneka ({add_boxes} dus {sku_t})")
                                 st.success(f"Diterima di **Toko Aneka** dan tercatat di log transfer!")
                                 st.rerun()
-                            
-                            # If destination is Surabaya or Jakarta, place into 8x6 rack system
                             else:
                                 existing_dest = conn.execute(
                                     "SELECT row_num, floor_num, bin_location, box_qty FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?",
@@ -1216,3 +1213,90 @@ with tab9:
         st.markdown("#### 📜 Riwayat Aktivitas Lengkap")
         log_df = pd.read_sql_query("SELECT timestamp AS 'Waktu', actor AS 'Aktor', action AS 'Aksi', details AS 'Detail' FROM activity_log ORDER BY id DESC LIMIT 50", conn)
         st.dataframe(log_df, width="stretch")
+
+# --- TAB 10: REAL-TIME NOTIFICATIONS & STAFF ACTIVITY FEED ---
+with tab10:
+    st.subheader("🔔 Pusat Notifikasi & Log Aktivitas Akun Staf")
+    st.caption("Pantau setiap aktivitas real-time yang dilakukan oleh masing-masing akun di Surabaya, Jakarta, dan Toko Aneka.")
+
+    all_logs_df = pd.read_sql_query(
+        "SELECT id, timestamp, actor, action, details FROM activity_log ORDER BY id DESC LIMIT 200",
+        conn
+    )
+
+    if all_logs_df.empty:
+        st.info("Belum ada aktivitas atau notifikasi yang tercatat di sistem.")
+    else:
+        today_prefix = datetime.now().strftime("%Y-%m-%d")
+        today_logs = all_logs_df[all_logs_df["timestamp"].str.startswith(today_prefix, na=False)]
+        override_logs = all_logs_df[all_logs_df["action"].isin(["OVERRIDE_APPROVED", "FORCE_OVERRIDE"])]
+        transfer_logs = all_logs_df[all_logs_df["action"].isin(["TRANSFER_SENT", "TRANSFER_RECEIVED"])]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Aktivitas Hari Ini", f"{len(today_logs)} Aksi")
+        m2.metric("Total Log Tercatat", f"{len(all_logs_df)} Log")
+        m3.metric("Aktivitas Transfer", f"{len(transfer_logs)} Log")
+        m4.metric("Pengecualian / Override", f"{len(override_logs)} Log")
+
+        st.divider()
+
+        # Filters for Account, Action Type, and Keyword
+        f_col1, f_col2, f_col3 = st.columns([1.2, 1.2, 1.6])
+        known_actors = ["Semua Akun"] + sorted(all_logs_df["actor"].dropna().unique().tolist())
+        selected_actor = f_col1.selectbox("Filter Akun Staf", known_actors, key="notif_actor_filter")
+
+        action_labels = {
+            "AUTO_ASSIGN": "🤖 Auto-Assign Rak",
+            "SIMPAN_RAK": "📥 Input Manual Rak",
+            "PICKING": "🛒 Picking / Surat Jalan",
+            "TRANSFER_SENT": "🚚 Kirim Transfer",
+            "TRANSFER_RECEIVED": "✅ Terima Transfer",
+            "CYCLE_COUNT_AUDIT": "🔄 Cycle Count Audit",
+            "OVERRIDE_APPROVED": "🔐 Override Disetujui",
+            "FORCE_OVERRIDE": "⚠️ Force Override Supervisor",
+            "IMPORT_MASSAL": "📊 Import Batch Excel"
+        }
+        available_actions = ["Semua Aktivitas"] + sorted(all_logs_df["action"].dropna().unique().tolist())
+        selected_action = f_col2.selectbox(
+            "Filter Jenis Aktivitas",
+            available_actions,
+            format_func=lambda x: action_labels.get(x, x),
+            key="notif_action_filter"
+        )
+        search_kw = f_col3.text_input("Cari SKU / Lokasi / Kata Kunci", placeholder="Contoh: JRN-1042, Toko Aneka, Jakarta...", key="notif_kw")
+
+        filtered_df = all_logs_df.copy()
+        if selected_actor != "Semua Akun":
+            filtered_df = filtered_df[filtered_df["actor"] == selected_actor]
+        if selected_action != "Semua Aktivitas":
+            filtered_df = filtered_df[filtered_df["action"] == selected_action]
+        if search_kw.strip():
+            kw_low = search_kw.strip().lower()
+            filtered_df = filtered_df[
+                filtered_df["details"].str.lower().str.contains(kw_low, na=False) |
+                filtered_df["actor"].str.lower().str.contains(kw_low, na=False)
+            ]
+
+        st.markdown(f"Menampilkan **{len(filtered_df)}** notifikasi terbaru:")
+
+        for _, row in filtered_df.head(50).iterrows():
+            act = row["action"]
+            actor_name = row["actor"] or "System"
+            ts = row["timestamp"]
+            det = row["details"]
+
+            if act in ("FORCE_OVERRIDE", "OVERRIDE_APPROVED"):
+                badge = "⚠️"
+            elif act in ("TRANSFER_SENT", "TRANSFER_RECEIVED"):
+                badge = "🚚"
+            elif act == "PICKING":
+                badge = "🛒"
+            elif act == "CYCLE_COUNT_AUDIT":
+                badge = "🔄"
+            else:
+                badge = "📦"
+
+            with st.container(border=True):
+                c_left, c_right = st.columns([4, 1])
+                c_left.markdown(f"{badge} **{actor_name}** — `{action_labels.get(act, act)}`\n\n{det}")
+                c_right.caption(f"🕒 {ts}")
