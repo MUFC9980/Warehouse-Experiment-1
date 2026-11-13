@@ -9,18 +9,29 @@ from openai import OpenAI
 
 # --- 1. LOCAL AI CONNECTION SETUP (LM Studio 1234 -> Jan AI 1337 -> Optional Cloud Fallback) ---
 def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
-    """Connects directly to Local AI (LM Studio 1234 or Jan AI 1337), skipping embedding models."""
+    """Connects directly to Local AI (LM Studio 1234 or Jan AI 1337), prioritizing Qwen/Chat models."""
     for port, server_name in ((1234, "LM Studio"), (1337, "Jan AI")):
         client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="not-needed", timeout=15.0)
         try:
             models = client.models.list()
             if models.data:
-                chat_models = [
-                    m.id for m in models.data
-                    if not any(bad in m.id.lower() for bad in ("embed", "bge", "e5-", "rerank"))
+                all_ids = [m.id for m in models.data]
+                # 1. Prioritize Qwen / Instruct / Chat models explicitly and block embedding models
+                preferred = [
+                    mid for mid in all_ids
+                    if any(good in mid.lower() for good in ("qwen", "instruct", "chat", "gemma", "llama"))
+                    and not any(bad in mid.lower() for bad in ("embed", "bge", "e5-", "rerank", "sentence-transformer"))
                 ]
-                chosen_model = chat_models[0] if chat_models else models.data[0].id
-                return client, chosen_model, f"Local AI ({server_name} :{port})"
+                if preferred:
+                    return client, preferred[0], f"Local AI ({server_name} :{port})"
+
+                # 2. Otherwise pick any non-embedding model
+                chat_models = [
+                    mid for mid in all_ids
+                    if not any(bad in mid.lower() for bad in ("embed", "bge", "e5-", "rerank", "sentence-transformer"))
+                ]
+                if chat_models:
+                    return client, chat_models[0], f"Local AI ({server_name} :{port})"
         except Exception:
             continue
 
@@ -38,7 +49,7 @@ def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
     if api_key:
         return OpenAI(base_url=base_url, api_key=api_key), model_name, "Cloud AI Fallback"
 
-    return OpenAI(base_url="http://127.0.0.1:1234/v1", api_key="not-needed"), "local-model", "Offline (Server Belum Aktif)"
+    return OpenAI(base_url="http://127.0.0.1:1337/v1", api_key="not-needed"), "Qwen2.5-3B-Instruct-4bit", "Offline (Server Belum Aktif)"
 
 # --- 2. DATABASE SETUP (SQLite + Persistent AI Memory) ---
 conn = sqlite3.connect("jurnal_bins.db", check_same_thread=False)
@@ -174,7 +185,6 @@ def auto_assign_bin(sku: str, name: str, cat: str, speed: str, notes: str) -> tu
     candidate_codes = [s[2] for s in valid_empty_slots]
     memory_block = get_memory_context()
 
-    # Try asking Local AI to select the best candidate from the valid empty slots
     try:
         client, active_model, status = get_ai_client_and_model()
         if not status.startswith("Offline"):
@@ -200,7 +210,6 @@ def auto_assign_bin(sku: str, name: str, cat: str, speed: str, notes: str) -> tu
     except Exception:
         pass
 
-    # Deterministic fallback: pick the first valid empty slot
     best_r, best_f, best_code = valid_empty_slots[0]
     return best_r, best_f, f"Dipilih otomatis sesuai aturan zonasi 85% ({best_code})."
 
@@ -443,7 +452,7 @@ DATA RAK SAAT INI:
                     except Exception as e:
                         st.error(
                             f"Gagal terhubung ke Local AI Server: {e}\n\n"
-                            "Pastikan di **LM Studio** / **Jan AI**, model yang dimuat adalah model Chat/Instruct (bukan model `embed`) dan reload model jika muncul error `logits computation`."
+                            "Pastikan di **LM Studio** / **Jan AI**, model Qwen2.5-3B-Instruct sudah dalam status **Started / Active**."
                         )
 
 # --- TAB 4: AMBIL BARANG DARI RAK & PRINTABLE INVOICE ---
