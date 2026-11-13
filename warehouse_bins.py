@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from datetime import datetime
 import pandas as pd
@@ -5,18 +6,36 @@ import streamlit as st
 import streamlit.components.v1 as components
 from openai import OpenAI
 
-# --- 1. LOCAL AI CONNECTION SETUP (LM Studio Port 1234 -> Jan AI Port 1337 Fallback) ---
-def get_ai_client_and_model() -> tuple[OpenAI, str]:
-    """Connects to LM Studio (1234) first, falling back to Jan AI (1337)."""
-    for port in (1234, 1337):
-        client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="not-needed")
+# --- 1. LOCAL AI CONNECTION SETUP (LM Studio 1234 -> Jan AI 1337 -> Optional Cloud Fallback) ---
+def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
+    """Connects directly to Local AI (LM Studio 1234 or Jan AI 1337) first."""
+    # 1. Primary: Local AI Servers on Mac (LM Studio port 1234, Jan AI port 1337)
+    for port, server_name in ((1234, "LM Studio"), (1337, "Jan AI")):
+        client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="not-needed", timeout=5.0)
         try:
             models = client.models.list()
             if models.data:
-                return client, models.data[0].id
+                return client, models.data[0].id, f"Local AI ({server_name} :{port})"
         except Exception:
             continue
-    return OpenAI(base_url="http://127.0.0.1:1234/v1", api_key="not-needed"), "local-model"
+
+    # 2. Secondary Fallback: Cloud API if configured via environment or Streamlit Secrets
+    api_key = os.getenv("AI_API_KEY", "")
+    base_url = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
+    model_name = os.getenv("AI_MODEL", "gpt-4o-mini")
+    try:
+        if "AI_API_KEY" in st.secrets:
+            api_key = st.secrets["AI_API_KEY"]
+            base_url = st.secrets.get("AI_BASE_URL", base_url)
+            model_name = st.secrets.get("AI_MODEL", model_name)
+    except Exception:
+        pass
+
+    if api_key:
+        return OpenAI(base_url=base_url, api_key=api_key), model_name, "Cloud AI Fallback"
+
+    # Default local client if neither server is currently started
+    return OpenAI(base_url="http://127.0.0.1:1234/v1", api_key="not-needed"), "local-model", "Offline (Server Belum Aktif)"
 
 # --- 2. DATABASE SETUP (SQLite + Persistent AI Memory) ---
 conn = sqlite3.connect("jurnal_bins.db", check_same_thread=False)
@@ -138,12 +157,12 @@ def validate_placement_against_rules(
 # --- 3. PAGE HEADER & TABS ---
 st.set_page_config(page_title="Sistem Rak Gudang 8x6 - Jurnal AI", layout="wide")
 st.title("📦 Sistem Lokasi Rak Gudang (8 Baris × 6 Lantai)")
-st.caption("Zonasi 85% Ketat • 15% Fleksibel • Picking & Printable Invoice")
+st.caption("Zonasi 85% Ketat • 15% Fleksibel • Picking & Printable Invoice • Local AI Ready")
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "1. Input Lokasi Rak SKU",
     "2. Peta Visual Rak (8×6)",
-    "3. Tanya AI (Dengan Memori)",
+    "3. Tanya AI (Local AI)",
     "4. Prediksi Rak Barang Masuk",
     "5. Ambil Barang & Invoice",
     "6. Import Excel / CSV",
@@ -262,7 +281,9 @@ with tab2:
 
 # --- TAB 3: TANYA AI (CHAT + MEMORI PERSISTEN) ---
 with tab3:
-    st.subheader("Asisten Gudang AI (Mengingat Aturan, Riwayat & Percakapan)")
+    st.subheader("Asisten Gudang AI (Local AI + Memori Permanen)")
+    _, active_model_preview, ai_status = get_ai_client_and_model()
+    st.caption(f"Status Koneksi AI: **{ai_status}** • Model: `{active_model_preview}`")
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -312,9 +333,9 @@ DATA RAK SAAT INI:
             recent_messages = [{"role": "system", "content": system_msg}] + st.session_state.chat_history[-6:]
 
             with st.chat_message("assistant"):
-                with st.spinner("Memeriksa database & memori gudang..."):
+                with st.spinner("Memeriksa database & memori dengan Local AI..."):
                     try:
-                        client, active_model = get_ai_client_and_model()
+                        client, active_model, _ = get_ai_client_and_model()
                         res = client.chat.completions.create(
                             model=active_model,
                             temperature=0.2,
@@ -325,7 +346,10 @@ DATA RAK SAAT INI:
                         st.markdown(reply)
                         st.session_state.chat_history.append({"role": "assistant", "content": reply})
                     except Exception as e:
-                        st.error(f"Gagal terhubung ke Local AI Server: {e}")
+                        st.error(
+                            f"Gagal terhubung ke Local AI Server: {e}\n\n"
+                            "Pastikan **LM Studio** (port `1234`) atau **Jan AI** (port `1337`) sudah dijalankan dan Local Server dalam status **Start**."
+                        )
 
 # --- TAB 4: PREDIKSI PENEMPATAN RAK BARANG MASUK ---
 with tab4:
@@ -358,9 +382,9 @@ Patuhi zonasi ini dan ATURAN GUDANG di bawah ini. Pilih 1 Kode Rak kosong terbai
 Rak terisi saat ini:
 {inventory_table}"""
 
-            with st.spinner("Menghitung slot terbaik berdasarkan zonasi..."):
+            with st.spinner("Menghitung slot terbaik menggunakan Local AI..."):
                 try:
-                    client, active_model = get_ai_client_and_model()
+                    client, active_model, _ = get_ai_client_and_model()
                     res = client.chat.completions.create(
                         model=active_model,
                         temperature=0.2,
@@ -372,7 +396,10 @@ Rak terisi saat ini:
                     )
                     st.success(res.choices[0].message.content)
                 except Exception as e:
-                    st.error(f"Gagal terhubung ke Local AI Server: {e}")
+                    st.error(
+                        f"Gagal terhubung ke Local AI Server: {e}\n\n"
+                        "Pastikan **LM Studio** (port `1234`) atau **Jan AI** (port `1337`) sudah aktif."
+                    )
 
 # --- TAB 5: AMBIL BARANG DARI RAK & PRINTABLE INVOICE ---
 with tab5:
@@ -433,18 +460,15 @@ with tab5:
                 grand_total = inv_items_df["Subtotal"].sum()
                 now_display = datetime.now().strftime("%d %B %Y, %H:%M WIB")
 
-                # Log picking activity
                 sku_summary = ", ".join([f"{x['Kode SKU']} ({x['Qty']}x dari {x['Kode Rak']})" for x in picked_items])
                 log_activity("AMBIL_BARANG", f"{invoice_no} untuk '{customer_name or 'Umum'}': {sku_summary}")
 
-                # Optionally remove picked SKUs from bin_map
                 if clear_from_rack:
                     for x in picked_items:
                         conn.execute("DELETE FROM bin_map WHERE jurnal_sku = ?", (x["Kode SKU"],))
                     conn.commit()
                     log_activity("KOSONGKAN_RAK", f"Slot dikosongkan otomatis setelah picking {invoice_no}")
 
-                # Build HTML rows
                 rows_html = ""
                 for i, item in enumerate(picked_items, start=1):
                     harga_str = f"Rp {item['Harga Satuan']:,.0f}".replace(",", ".") if item["Harga Satuan"] > 0 else "-"
