@@ -1,10 +1,9 @@
 import os
 import re
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from openai import OpenAI
 
 # --- PAGE CONFIGURATION ---
@@ -114,7 +113,6 @@ conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
 conn.execute("PRAGMA temp_store=MEMORY;")
 
-# Check if bin_map exists and needs migration to composite primary key (warehouse, jurnal_sku)
 table_exists = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='bin_map'").fetchone()
 
 if not table_exists:
@@ -150,7 +148,6 @@ else:
     if "picker_name" not in existing_cols:
         conn.execute("ALTER TABLE bin_map ADD COLUMN picker_name TEXT")
     if "warehouse" not in existing_cols:
-        # Migrate legacy single-warehouse table safely to composite PK (warehouse, jurnal_sku)
         conn.execute("""
             CREATE TABLE bin_map_new (
                 warehouse TEXT DEFAULT 'Surabaya',
@@ -188,6 +185,42 @@ else:
 conn.execute("CREATE INDEX IF NOT EXISTS idx_wh_bin_location ON bin_map(warehouse, row_num, floor_num);")
 conn.execute("CREATE INDEX IF NOT EXISTS idx_product_name ON bin_map(product_name);")
 conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON bin_map(category);")
+
+# Sales / Outbound Velocity Table (Tracks sales per warehouse so AI learns demand)
+conn.execute("""
+    CREATE TABLE IF NOT EXISTS outbound_sales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        warehouse TEXT,
+        jurnal_sku TEXT,
+        product_name TEXT,
+        boxes_sold INTEGER,
+        sale_date TEXT,
+        invoice_no TEXT,
+        actor TEXT
+    )
+""")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_wh_sku ON outbound_sales(warehouse, jurnal_sku, sale_date);")
+
+# Inter-Warehouse Stock Transfer Tracker Table (Surabaya <-> Jakarta)
+conn.execute("""
+    CREATE TABLE IF NOT EXISTS stock_transfers (
+        transfer_id TEXT PRIMARY KEY,
+        from_warehouse TEXT,
+        to_warehouse TEXT,
+        jurnal_sku TEXT,
+        product_name TEXT,
+        category TEXT,
+        turnover_speed TEXT,
+        box_qty INTEGER,
+        pcs_per_box INTEGER,
+        status TEXT,
+        created_at TEXT,
+        received_at TEXT,
+        sender TEXT,
+        receiver TEXT,
+        courier_notes TEXT
+    )
+""")
 
 conn.execute("""
     CREATE TABLE IF NOT EXISTS warehouse_memory (
@@ -255,6 +288,104 @@ def get_warehouse_stats(warehouse: str | None = None) -> dict:
         "total_slots": total_slots
     }
 
+# --- DEMAND & TRANSFER INTELLIGENCE ENGINE ---
+def compute_jakarta_transfer_recommendations() -> pd.DataFrame:
+    """
+    Learns Jakarta's 30-day sales velocity from outbound_sales and compares against
+    Jakarta's current stock + Surabaya's available surplus + active in-transit transfers.
+    """
+    cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    
+    # 1. Sales velocity in Jakarta over the past 30 days
+    sales_df = pd.read_sql_query("""
+        SELECT
+            jurnal_sku,
+            MAX(product_name) AS product_name,
+            COALESCE(SUM(boxes_sold), 0) AS sold_30d,
+            COUNT(DISTINCT substr(sale_date, 1, 10)) AS active_days
+        FROM outbound_sales
+        WHERE warehouse = 'Jakarta' AND sale_date >= ?
+        GROUP BY jurnal_sku
+    """, conn, params=[cutoff_date])
+
+    # 2. Current stock in Jakarta and Surabaya
+    jkt_df = pd.read_sql_query("""
+        SELECT jurnal_sku, product_name, box_qty AS jkt_boxes, min_box_threshold
+        FROM bin_map WHERE warehouse = 'Jakarta'
+    """, conn)
+    sby_df = pd.read_sql_query("""
+        SELECT jurnal_sku, product_name, box_qty AS sby_boxes, min_box_threshold AS sby_min
+        FROM bin_map WHERE warehouse = 'Surabaya'
+    """, conn)
+
+    # 3. In-transit shipments already heading to Jakarta
+    transit_df = pd.read_sql_query("""
+        SELECT jurnal_sku, COALESCE(SUM(box_qty), 0) AS in_transit_boxes
+        FROM stock_transfers
+        WHERE to_warehouse = 'Jakarta' AND status = 'In-Transit'
+        GROUP BY jurnal_sku
+    """, conn)
+
+    # Merge all SKUs seen in Jakarta stock or Jakarta sales
+    all_skus = set(jkt_df["jurnal_sku"]).union(set(sales_df["jurnal_sku"]))
+    if not all_skus:
+        return pd.DataFrame()
+
+    jkt_map = jkt_df.set_index("jurnal_sku").to_dict("index")
+    sby_map = sby_df.set_index("jurnal_sku").to_dict("index")
+    sales_map = sales_df.set_index("jurnal_sku").to_dict("index")
+    transit_map = transit_df.set_index("jurnal_sku")["in_transit_boxes"].to_dict() if not transit_df.empty else {}
+
+    rows = []
+    for sku in sorted(all_skus):
+        j_info = jkt_map.get(sku, {})
+        s_info = sby_map.get(sku, {})
+        sl_info = sales_map.get(sku, {})
+
+        prod_name = j_info.get("product_name") or sl_info.get("product_name") or s_info.get("product_name") or sku
+        jkt_boxes = int(j_info.get("jkt_boxes", 0))
+        min_thresh = int(j_info.get("min_box_threshold", 3))
+        in_transit = int(transit_map.get(sku, 0))
+        effective_jkt = jkt_boxes + in_transit
+
+        sold_30d = int(sl_info.get("sold_30d", 0))
+        # Calculate daily velocity over 30-day window (minimum 1 day divisor if recent)
+        daily_rate = round(sold_30d / 30.0, 2) if sold_30d > 0 else 0.0
+        days_left = round(effective_jkt / daily_rate, 1) if daily_rate > 0 else (999.0 if effective_jkt > min_thresh else 0.0)
+
+        sby_boxes = int(s_info.get("sby_boxes", 0))
+        sby_min = int(s_info.get("sby_min", 3))
+        sby_surplus = max(0, sby_boxes - sby_min)
+
+        # Target 21-day stock coverage in Jakarta or at least double the minimum threshold
+        target_jkt_stock = max(min_thresh * 2, int(round(daily_rate * 21)))
+        needed_boxes = max(0, target_jkt_stock - effective_jkt)
+
+        needs_transfer = (effective_jkt <= min_thresh) or (daily_rate > 0 and days_left < 14.0)
+        if needs_transfer and needed_boxes > 0:
+            suggested_transfer = min(needed_boxes, sby_surplus)
+            if suggested_transfer > 0:
+                action_status = f"🚚 Transfer {suggested_transfer} dus dari Surabaya"
+            elif sby_boxes > 0:
+                action_status = "⚠️ Stok Surabaya mepet (PO Supplier)"
+            else:
+                action_status = "🛒 Kosong di Surabaya (Wajib PO Supplier)"
+
+            rows.append({
+                "SKU": sku,
+                "Produk": prod_name,
+                "Stok JKT": jkt_boxes,
+                "In-Transit": in_transit,
+                "Terjual JKT (30h)": sold_30d,
+                "Sales/Hari": daily_rate,
+                "Estimasi Habis": f"{days_left} hari" if daily_rate > 0 else "Di bawah min.",
+                "Surplus SBY": sby_surplus,
+                "Saran Transfer": suggested_transfer,
+                "Rekomendasi": action_status
+            })
+
+    return pd.DataFrame(rows)
+
 def get_memory_context() -> str:
     mem_df = pd.read_sql_query(
         "SELECT category, memory_text FROM warehouse_memory ORDER BY id DESC LIMIT 30",
@@ -276,14 +407,22 @@ def get_memory_context() -> str:
 def search_inventory_for_ai(query_text: str, limit: int = 30) -> str:
     sby = get_warehouse_stats("Surabaya")
     jkt = get_warehouse_stats("Jakarta")
+    in_transit_cnt = conn.execute("SELECT COALESCE(SUM(box_qty), 0) FROM stock_transfers WHERE status = 'In-Transit'").fetchone()[0]
+    
     summary_header = (
         f"RINGKASAN GUDANG:\n"
         f"- SURABAYA: {sby['total_skus']:,} SKU | {sby['total_boxes']:,} Dus | {sby['occupied_bins']}/48 Slot Terisi.\n"
-        f"- JAKARTA: {jkt['total_skus']:,} SKU | {jkt['total_boxes']:,} Dus | {jkt['occupied_bins']}/48 Slot Terisi."
+        f"- JAKARTA: {jkt['total_skus']:,} SKU | {jkt['total_boxes']:,} Dus | {jkt['occupied_bins']}/48 Slot Terisi.\n"
+        f"- IN-TRANSIT (SBY <-> JKT): {int(in_transit_cnt):,} Dus sedang dalam perjalanan."
     ).replace(",", ".")
 
+    rec_df = compute_jakarta_transfer_recommendations()
+    rec_text = ""
+    if not rec_df.empty:
+        rec_text = "\n\nANALISIS PENJUALAN JAKARTA & REKOMENDASI TRANSFER:\n" + rec_df.to_csv(index=False)
+
     if (sby["total_skus"] + jkt["total_skus"]) == 0:
-        return f"{summary_header}\nSemua slot di Surabaya dan Jakarta masih kosong."
+        return f"{summary_header}\nSemua slot di Surabaya dan Jakarta masih kosong.{rec_text}"
 
     slot_summary_df = pd.read_sql_query("""
         SELECT warehouse, bin_location, COUNT(*) AS sku_count, COALESCE(SUM(box_qty), 0) AS total_dus
@@ -332,7 +471,7 @@ def search_inventory_for_ai(query_text: str, limit: int = 30) -> str:
         )
 
     matched_csv = matched_df.to_csv(index=False) if not matched_df.empty else "Tidak ada SKU yang cocok."
-    return f"{summary_header}\nKETERISIAN: {slot_lines}\n\nSAMPEL SKU:\n{matched_csv}"
+    return f"{summary_header}\nKETERISIAN: {slot_lines}{rec_text}\n\nSAMPEL SKU:\n{matched_csv}"
 
 def validate_placement_against_rules(
     sku: str, name: str, cat: str, row_num: int, floor_num: int, speed: str, notes: str
@@ -596,10 +735,13 @@ with head_col2:
 
 sby_stats = get_warehouse_stats("Surabaya")
 jkt_stats = get_warehouse_stats("Jakarta")
+in_transit_total = conn.execute("SELECT COALESCE(SUM(box_qty), 0) FROM stock_transfers WHERE status = 'In-Transit'").fetchone()[0]
+
 st.caption(
     f"Zonasi 85% • 15% Fleksibel | "
     f"**Surabaya:** {sby_stats['total_skus']:,} SKU ({sby_stats['occupied_bins']}/48 Slot) • "
-    f"**Jakarta:** {jkt_stats['total_skus']:,} SKU ({jkt_stats['occupied_bins']}/48 Slot)"
+    f"**Jakarta:** {jkt_stats['total_skus']:,} SKU ({jkt_stats['occupied_bins']}/48 Slot) • "
+    f"**In-Transit:** {int(in_transit_total):,} Dus"
 )
 
 if "tab6_unlocked" not in st.session_state:
@@ -607,15 +749,16 @@ if "tab6_unlocked" not in st.session_state:
 if "pending_force_override" not in st.session_state:
     st.session_state.pending_force_override = None
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "1. Input & Zonasi",
     "2. Peta Rak & Audit",
     "3. Asisten AI",
     "4. Picking & Invoice",
-    "5. Reorder Alerts ⚠️",
-    "6. FIFO & Expiry ⏳",
-    "7. Import Excel",
-    "8. 🔒 Memori & Leaderboard"
+    "5. 🚚 Transfer SBY ↔ JKT",
+    "6. Reorder & Demand ⚠️",
+    "7. FIFO & Expiry ⏳",
+    "8. Import Excel",
+    "9. 🔒 Memori & Leaderboard"
 ])
 
 # --- TAB 1: INPUT & PEMETAAN RAK (SURABAYA & JAKARTA) ---
@@ -678,19 +821,24 @@ with tab2:
 
 # --- TAB 3: ASISTEN AI ---
 with tab3:
-    st.subheader("🤖 Asisten Gudang & Prediksi Penempatan Rak (Surabaya & Jakarta)")
+    st.subheader("🤖 Asisten Gudang & Prediksi Penjualan Jakarta / Transfer SBY → JKT")
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
     
-    chat_input = st.chat_input("Tanya lokasi barang di Surabaya/Jakarta, stok, atau rekomendasi rak...")
+    chat_input = st.chat_input("Tanya lokasi barang, kecepatan jual Jakarta, atau saran transfer Surabaya ke Jakarta...")
     if chat_input:
         st.session_state.chat_history.append({"role": "user", "content": chat_input})
         rel_inv = search_inventory_for_ai(chat_input)
         mem_block = get_memory_context()
-        sys_prompt = f"Asisten Kepala Gudang untuk cabang Surabaya dan Jakarta (masing-masing 8 Baris x 6 Lantai). Zonasi: Fast-Moving (L1-L2), Medium (L3-L4), Slow/Bulky (L5-L6).\n{mem_block}\n\n{rel_inv}"
+        sys_prompt = (
+            f"Asisten Kepala Gudang untuk cabang Surabaya dan Jakarta (masing-masing 8 Baris x 6 Lantai). "
+            f"Zonasi: Fast-Moving (L1-L2), Medium (L3-L4), Slow/Bulky (L5-L6). "
+            f"Anda juga memantau kecepatan penjualan Jakarta dan merekomendasikan transfer stok dari Surabaya ke Jakarta jika stok Jakarta menipis (<14 hari).\n"
+            f"{mem_block}\n\n{rel_inv}"
+        )
         try:
             client, active_model, _ = get_ai_client_and_model()
-            res = client.chat.completions.create(model=active_model, temperature=0.2, max_tokens=300, messages=[{"role": "system", "content": sys_prompt}] + st.session_state.chat_history[-6:])
+            res = client.chat.completions.create(model=active_model, temperature=0.2, max_tokens=350, messages=[{"role": "system", "content": sys_prompt}] + st.session_state.chat_history[-6:])
             reply = res.choices[0].message.content
         except Exception as e:
             reply = f"Error AI: {e}"
@@ -700,9 +848,9 @@ with tab3:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-# --- TAB 4: PICKING & INVOICE ---
+# --- TAB 4: PICKING & INVOICE (LOGS SALES VELOCITY) ---
 with tab4:
-    st.subheader("🛒 Picking & Cetak Surat Jalan")
+    st.subheader("🛒 Picking & Cetak Surat Jalan (Pencatat Kecepatan Penjualan)")
     pick_wh = st.selectbox("Pilih Cabang Gudang Asal", WAREHOUSES, key="pick_wh_select")
     pick_df = pd.read_sql_query(
         "SELECT jurnal_sku, product_name, bin_location, box_qty, pcs_per_box, expiry_date FROM bin_map WHERE warehouse = ? ORDER BY row_num, floor_num LIMIT 150",
@@ -728,33 +876,208 @@ with tab4:
                 picked_items.append({"sku": r['jurnal_sku'], "name": r['product_name'], "bin": r['bin_location'], "ambil": q_ambil, "avail": int(r['box_qty']), "price": price})
 
             if st.button(f"🧾 Buat Surat Jalan & Potong Stok ({pick_wh})"):
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
                 for it in picked_items:
                     rem = it["avail"] - it["ambil"]
                     if rem <= 0:
                         conn.execute("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (pick_wh, it["sku"]))
                     else:
                         conn.execute("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (rem, pick_wh, it["sku"]))
+                    
+                    # Record outbound sale velocity for AI demand learning
+                    conn.execute("""
+                        INSERT INTO outbound_sales (warehouse, jurnal_sku, product_name, boxes_sold, sale_date, invoice_no, actor)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (pick_wh, it["sku"], it["name"], int(it["ambil"]), now_str, inv_no, picker))
+                
                 conn.commit()
                 log_activity("PICKING", f"[{pick_wh}] Picking {inv_no} oleh {picker} untuk {len(picked_items)} SKU", actor=picker)
-                st.success(f"Surat Jalan **{inv_no}** ({pick_wh}) berhasil diterbitkan dan stok dipotong otomatis!")
+                st.success(f"Surat Jalan **{inv_no}** ({pick_wh}) berhasil diterbitkan! Data penjualan otomatis direkam untuk analisis AI.")
 
-# --- TAB 5: REORDER ALERTS ---
+# --- TAB 5: DEDICATED INTER-WAREHOUSE TRANSFER TRACKER (SBY <-> JKT) ---
 with tab5:
-    st.subheader("⚠️ Low Stock & Reorder Alerts")
+    st.subheader("🚚 Tracker Pengiriman Antar Gudang (Surabaya ↔ Jakarta)")
+
+    # Show AI Smart Transfer Banner if Jakarta needs restocking from Surabaya
+    smart_recs = compute_jakarta_transfer_recommendations()
+    if not smart_recs.empty:
+        transferable = smart_recs[smart_recs["Saran Transfer"] > 0]
+        if not transferable.empty:
+            st.warning(f"🤖 **Notifikasi AI Demand Jakarta:** Terdapat **{len(transferable)} SKU** di Jakarta yang menipis berdasarkan kecepatan penjualan dan siap ditransfer dari Surabaya!")
+            st.dataframe(transferable[["SKU", "Produk", "Stok JKT", "In-Transit", "Terjual JKT (30h)", "Estimasi Habis", "Surplus SBY", "Saran Transfer"]], width="stretch")
+
+    st.divider()
+    col_tr1, col_tr2 = st.columns([1.2, 1.8])
+
+    # LEFT: Create New Transfer Shipment
+    with col_tr1:
+        st.markdown("#### 📤 Buat Pengiriman Baru")
+        origin_wh = st.selectbox("Gudang Pengirim", ["Surabaya", "Jakarta"], key="tr_origin")
+        dest_wh = "Jakarta" if origin_wh == "Surabaya" else "Surabaya"
+        st.info(f"Tujuan Pengiriman: **Gudang {dest_wh}**")
+
+        avail_df = pd.read_sql_query(
+            "SELECT jurnal_sku, product_name, category, turnover_speed, bin_location, box_qty, pcs_per_box FROM bin_map WHERE warehouse = ? AND box_qty > 0 ORDER BY jurnal_sku",
+            conn, params=[origin_wh]
+        )
+
+        if avail_df.empty:
+            st.warning(f"Tidak ada stok tersedia di {origin_wh} untuk dikirim.")
+        else:
+            avail_df["opt"] = avail_df.apply(lambda r: f"{r['jurnal_sku']} — {r['product_name']} (Rak {r['bin_location']} | Tersedia: {r['box_qty']} dus)", axis=1)
+            chosen_opt = st.selectbox("Pilih Barang yang Ditransfer", avail_df["opt"].tolist())
+            chosen_row = avail_df[avail_df["opt"] == chosen_opt].iloc[0]
+
+            with st.form("create_transfer_form"):
+                tr_qty = st.number_input("Jumlah Dus Dikirim", min_value=1, max_value=int(chosen_row["box_qty"]), value=1, step=1)
+                courier_info = st.text_input("Ekspedisi / No. Resi / Driver", placeholder="Contoh: Kalog / Kargo Udara / Resi #12345")
+                if st.form_submit_button(f"🚚 Kirim ke {dest_wh} (Set In-Transit)", use_container_width=True):
+                    tr_id = f"TRF-{origin_wh[:3].upper()}-{dest_wh[:3].upper()}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    
+                    # Deduct from origin warehouse
+                    rem_origin = int(chosen_row["box_qty"]) - int(tr_qty)
+                    if rem_origin <= 0:
+                        conn.execute("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (origin_wh, chosen_row["jurnal_sku"]))
+                    else:
+                        conn.execute("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (rem_origin, origin_wh, chosen_row["jurnal_sku"]))
+                    
+                    # Insert into stock_transfers as In-Transit
+                    pcs_box_val = int(chosen_row["pcs_per_box"]) if pd.notna(chosen_row["pcs_per_box"]) else None
+                    conn.execute("""
+                        INSERT INTO stock_transfers (
+                            transfer_id, from_warehouse, to_warehouse, jurnal_sku, product_name,
+                            category, turnover_speed, box_qty, pcs_per_box, status, created_at, sender, courier_notes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'In-Transit', ?, ?, ?)
+                    """, (
+                        tr_id, origin_wh, dest_wh, chosen_row["jurnal_sku"], chosen_row["product_name"],
+                        chosen_row["category"], chosen_row["turnover_speed"], int(tr_qty), pcs_box_val,
+                        now_ts, st.session_state.current_user, courier_info.strip()
+                    ))
+                    conn.commit()
+                    log_activity("TRANSFER_SENT", f"{tr_id}: {tr_qty} dus {chosen_row['jurnal_sku']} ({origin_wh} -> {dest_wh})")
+                    st.success(f"Pengiriman **{tr_id}** tercatat In-Transit ke {dest_wh}!")
+                    st.rerun()
+
+    # RIGHT: Live In-Transit Tracker & Receive Confirmation
+    with col_tr2:
+        st.markdown("#### 🛰️ Status Barang Dalam Perjalanan (In-Transit)")
+        transit_list = pd.read_sql_query(
+            "SELECT * FROM stock_transfers WHERE status = 'In-Transit' ORDER BY created_at DESC",
+            conn
+        )
+        if transit_list.empty:
+            st.success("✅ Tidak ada barang yang tertahan di perjalanan. Semua transfer sudah diterima.")
+        else:
+            for _, tr in transit_list.iterrows():
+                with st.container(border=True):
+                    t_c1, t_c2 = st.columns([2.5, 1])
+                    with t_c1:
+                        st.markdown(f"**{tr['transfer_id']}** | `{tr['from_warehouse']}` ➡️ **`{tr['to_warehouse']}`**")
+                        st.write(f"📦 **{tr['jurnal_sku']}** — {tr['product_name']} (**{tr['box_qty']} dus**)")
+                        st.caption(f"Dikirim: {tr['created_at']} oleh {tr['sender']} | Ekspedisi: {tr['courier_notes'] or '-'}")
+                    with t_c2:
+                        if st.button(f"✅ Terima di {tr['to_warehouse']}", key=f"rcv_{tr['transfer_id']}", type="primary", use_container_width=True):
+                            dest = tr["to_warehouse"]
+                            sku_t = tr["jurnal_sku"]
+                            add_boxes = int(tr["box_qty"])
+                            
+                            # Check if SKU already has a bin in destination warehouse
+                            existing_dest = conn.execute(
+                                "SELECT row_num, floor_num, bin_location, box_qty FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?",
+                                (dest, sku_t)
+                            ).fetchone()
+
+                            if existing_dest:
+                                new_total = int(existing_dest[3]) + add_boxes
+                                conn.execute(
+                                    "UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?",
+                                    (new_total, dest, sku_t)
+                                )
+                                assigned_bin = existing_dest[2]
+                            else:
+                                pcs_v = int(tr["pcs_per_box"]) if pd.notna(tr["pcs_per_box"]) else None
+                                ar, af, _ = auto_assign_bin(
+                                    dest, sku_t, tr["product_name"], tr["category"] or "",
+                                    tr["turnover_speed"] or "Medium (Normal)", "", add_boxes, pcs_v
+                                )
+                                ar = ar or 1
+                                af = af or 3
+                                assigned_bin = f"R{ar:02d}-L{af}"
+                                conn.execute("""
+                                    INSERT INTO bin_map (
+                                        warehouse, jurnal_sku, product_name, category, row_num, floor_num,
+                                        bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 3)
+                                """, (
+                                    dest, sku_t, tr["product_name"], tr["category"] or "", ar, af,
+                                    assigned_bin, tr["turnover_speed"] or "Medium (Normal)",
+                                    f"Transfer dari {tr['from_warehouse']}", add_boxes, pcs_v
+                                ))
+
+                            now_rcv = datetime.now().strftime("%Y-%m-%d %H:%M")
+                            conn.execute("""
+                                UPDATE stock_transfers
+                                SET status = 'Completed', received_at = ?, receiver = ?
+                                WHERE transfer_id = ?
+                            """, (now_rcv, st.session_state.current_user, tr["transfer_id"]))
+                            conn.commit()
+                            log_activity("TRANSFER_RECEIVED", f"{tr['transfer_id']} diterima di {dest} -> Rak {assigned_bin}")
+                            st.success(f"Diterima! Masuk ke Rak **{dest} | {assigned_bin}**")
+                            st.rerun()
+
+        st.divider()
+        st.markdown("#### 📜 Riwayat Transfer Selesai (Completed)")
+        completed_df = pd.read_sql_query("""
+            SELECT transfer_id AS 'No. Transfer', from_warehouse AS 'Dari', to_warehouse AS 'Ke',
+                   jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus',
+                   created_at AS 'Tgl Kirim', received_at AS 'Tgl Terima', receiver AS 'Penerima'
+            FROM stock_transfers WHERE status = 'Completed' ORDER BY received_at DESC LIMIT 30
+        """, conn)
+        if completed_df.empty:
+            st.caption("Belum ada riwayat transfer yang selesai.")
+        else:
+            st.dataframe(completed_df, width="stretch")
+
+# --- TAB 6: REORDER ALERTS & JAKARTA DEMAND INTELLIGENCE ---
+with tab6:
+    st.subheader("⚠️ AI Demand Learning (Jakarta) & Reorder Alerts")
+    
+    st.markdown("#### 🧠 Analisis Kecepatan Jual Jakarta & Saran Transfer Surabaya → Jakarta")
+    rec_table = compute_jakarta_transfer_recommendations()
+    if rec_table.empty:
+        st.info("Belum ada lonjakan penjualan di Jakarta yang membutuhkan transfer stok dari Surabaya saat ini.")
+    else:
+        st.dataframe(rec_table, width="stretch")
+        if st.button("🤖 Minta Ringkasan Keputusan Pembelian & Transfer dari AI"):
+            with st.spinner("AI menganalisis kecepatan penjualan Jakarta vs stok Surabaya..."):
+                try:
+                    client, active_model, _ = get_ai_client_and_model()
+                    prompt = (
+                        "Anda adalah Supply Chain Manager. Berdasarkan data penjualan 30 hari terakhir di Jakarta dan stok Surabaya berikut, "
+                        "berikan rekomendasi singkat (maksimal 5 poin) barang mana yang harus segera ditransfer dari Surabaya ke Jakarta dan mana yang harus di-PO ke supplier:\n\n"
+                        + rec_table.to_csv(index=False)
+                    )
+                    res = client.chat.completions.create(model=active_model, temperature=0.2, max_tokens=350, messages=[{"role": "user", "content": prompt}])
+                    st.info(res.choices[0].message.content)
+                except Exception as e:
+                    st.error(f"AI sedang offline: {e}")
+
+    st.divider()
+    st.markdown("#### 📉 Daftar Stok Di Bawah Batas Minimum (Surabaya & Jakarta)")
     low_stock_df = pd.read_sql_query(
         "SELECT warehouse AS 'Gudang', bin_location AS 'Rak', jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus Tersisa', min_box_threshold AS 'Batas Minimum' FROM bin_map WHERE box_qty <= min_box_threshold ORDER BY warehouse, box_qty ASC",
         conn
     )
     if low_stock_df.empty:
-        st.success("✨ Semua stok di Surabaya & Jakarta aman! Tidak ada SKU di bawah batas minimum.")
+        st.success("✨ Semua stok di Surabaya & Jakarta berada di atas batas minimum.")
     else:
-        st.warning(f"Ditemukan **{len(low_stock_df)} SKU** yang menipis dan perlu segera direorder:")
         st.dataframe(low_stock_df, width="stretch")
         csv_reorder = low_stock_df.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download Daftar Reorder (CSV)", data=csv_reorder, file_name="reorder_list_sby_jkt.csv", mime="text/csv")
 
-# --- TAB 6: FIFO & EXPIRY TRACKING ---
-with tab6:
+# --- TAB 7: FIFO & EXPIRY TRACKING ---
+with tab7:
     st.subheader("⏳ FIFO & Expiry Date Management")
     expiry_df = pd.read_sql_query(
         "SELECT warehouse AS 'Gudang', bin_location AS 'Rak', jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus', expiry_date AS 'Expired Date' FROM bin_map WHERE expiry_date IS NOT NULL ORDER BY expiry_date ASC",
@@ -766,8 +1089,8 @@ with tab6:
         st.markdown("Daftar produk diurutkan berdasarkan kedaluwarsa terdekat (**FIFO Priority**):")
         st.dataframe(expiry_df, width="stretch")
 
-# --- TAB 7: IMPORT EXCEL / CSV ---
-with tab7:
+# --- TAB 8: IMPORT EXCEL / CSV ---
+with tab8:
     st.subheader("Import Massal WMS")
     default_import_wh = st.selectbox("Gudang Default (jika kolom 'warehouse' tidak ada di file)", WAREHOUSES)
     up_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
@@ -803,11 +1126,11 @@ with tab7:
             log_activity("IMPORT_MASSAL", f"Import {len(records)} SKU")
             st.success(f"Berhasil mengimpor {len(records)} SKU!")
 
-# --- TAB 8: MEMORI & LEADERBOARD (PASSCODE PROTECTED) ---
-with tab8:
+# --- TAB 9: MEMORI & LEADERBOARD (PASSCODE PROTECTED) ---
+with tab9:
     st.subheader("🧠 Memori Aturan & Staff Activity Leaderboard")
     if not st.session_state.tab6_unlocked:
-        with st.form("unlock_t8"):
+        with st.form("unlock_t9"):
             p_in = st.text_input("Passcode Supervisor:", type="password")
             if st.form_submit_button("Buka Kunci"):
                 if p_in.strip() == SUPERVISOR_PIN:
