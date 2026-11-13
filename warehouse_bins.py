@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 from datetime import datetime
 import pandas as pd
@@ -8,18 +9,21 @@ from openai import OpenAI
 
 # --- 1. LOCAL AI CONNECTION SETUP (LM Studio 1234 -> Jan AI 1337 -> Optional Cloud Fallback) ---
 def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
-    """Connects directly to Local AI (LM Studio 1234 or Jan AI 1337) first."""
-    # 1. Primary: Local AI Servers on Mac (LM Studio port 1234, Jan AI port 1337)
+    """Connects directly to Local AI (LM Studio 1234 or Jan AI 1337), skipping embedding models."""
     for port, server_name in ((1234, "LM Studio"), (1337, "Jan AI")):
-        client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="not-needed", timeout=5.0)
+        client = OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="not-needed", timeout=15.0)
         try:
             models = client.models.list()
             if models.data:
-                return client, models.data[0].id, f"Local AI ({server_name} :{port})"
+                chat_models = [
+                    m.id for m in models.data
+                    if not any(bad in m.id.lower() for bad in ("embed", "bge", "e5-", "rerank"))
+                ]
+                chosen_model = chat_models[0] if chat_models else models.data[0].id
+                return client, chosen_model, f"Local AI ({server_name} :{port})"
         except Exception:
             continue
 
-    # 2. Secondary Fallback: Cloud API if configured via environment or Streamlit Secrets
     api_key = os.getenv("AI_API_KEY", "")
     base_url = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
     model_name = os.getenv("AI_MODEL", "gpt-4o-mini")
@@ -34,7 +38,6 @@ def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
     if api_key:
         return OpenAI(base_url=base_url, api_key=api_key), model_name, "Cloud AI Fallback"
 
-    # Default local client if neither server is currently started
     return OpenAI(base_url="http://127.0.0.1:1234/v1", api_key="not-needed"), "local-model", "Offline (Server Belum Aktif)"
 
 # --- 2. DATABASE SETUP (SQLite + Persistent AI Memory) ---
@@ -108,7 +111,6 @@ def validate_placement_against_rules(
     """Enforces 85% strict floor turnover rules and custom row memory rules."""
     speed_low = speed.lower()
 
-    # 1. Strict Floor-Turnover Rules (85% Enforcement)
     if "fast-moving" in speed_low:
         if floor_num not in (1, 2):
             return False, f"Barang Fast-Moving wajib ditaruh di Lantai 1 atau 2 (Anda memilih Lantai {floor_num})."
@@ -119,7 +121,6 @@ def validate_placement_against_rules(
         if floor_num not in (5, 6):
             return False, f"Barang Slow-Moving / Bulky wajib ditaruh di Lantai 5 atau 6 (Anda memilih Lantai {floor_num})."
 
-    # 2. Check custom row rules in warehouse_memory
     mem_df = pd.read_sql_query(
         "SELECT category, memory_text FROM warehouse_memory ORDER BY id DESC",
         conn
@@ -154,25 +155,73 @@ def validate_placement_against_rules(
 
     return True, ""
 
-# --- 3. PAGE HEADER & TABS ---
+def auto_assign_bin(sku: str, name: str, cat: str, speed: str, notes: str) -> tuple[int | None, int | None, str]:
+    """Finds valid empty slots matching 85% rules and asks Local AI to pick the best one."""
+    occupied_df = pd.read_sql_query("SELECT row_num, floor_num FROM bin_map", conn)
+    occupied_set = set(zip(occupied_df["row_num"], occupied_df["floor_num"]))
+
+    valid_empty_slots = []
+    for r in range(1, 9):
+        for f in range(1, 7):
+            if (r, f) not in occupied_set:
+                ok, _ = validate_placement_against_rules(sku, name, cat, r, f, speed, notes)
+                if ok:
+                    valid_empty_slots.append((r, f, f"R{r:02d}-L{f}"))
+
+    if not valid_empty_slots:
+        return None, None, "Semua slot yang sesuai dengan zonasi barang ini sudah penuh!"
+
+    candidate_codes = [s[2] for s in valid_empty_slots]
+    memory_block = get_memory_context()
+
+    # Try asking Local AI to select the best candidate from the valid empty slots
+    try:
+        client, active_model, status = get_ai_client_and_model()
+        if not status.startswith("Offline"):
+            prompt = (
+                f"Pilih TEPAT SATU kode rak terbaik untuk produk baru berikut dari daftar slot kosong yang tersedia.\n"
+                f"Produk: {sku} - {name} (Kategori: {cat}, Perputaran: {speed}, Catatan: {notes})\n"
+                f"Slot kosong valid: {', '.join(candidate_codes)}\n"
+                f"{memory_block}\n\n"
+                f"Balas HANYA dengan kode rak (contoh: R01-L1) diikuti 1 kalimat alasan singkat."
+            )
+            res = client.chat.completions.create(
+                model=active_model,
+                temperature=0.1,
+                max_tokens=80,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            ai_reply = res.choices[0].message.content.strip()
+            match = re.search(r"R0([1-8])-L([1-6])", ai_reply.upper())
+            if match:
+                chosen_code = f"R0{match.group(1)}-L{match.group(2)}"
+                if chosen_code in candidate_codes:
+                    return int(match.group(1)), int(match.group(2)), f"Dipilih oleh AI ({chosen_code}): {ai_reply}"
+    except Exception:
+        pass
+
+    # Deterministic fallback: pick the first valid empty slot
+    best_r, best_f, best_code = valid_empty_slots[0]
+    return best_r, best_f, f"Dipilih otomatis sesuai aturan zonasi 85% ({best_code})."
+
+# --- 3. PAGE HEADER & TABS (6 STREAMLINED TABS) ---
 st.set_page_config(page_title="Sistem Rak Gudang 8x6 - Jurnal AI", layout="wide")
 st.title("📦 Sistem Lokasi Rak Gudang (8 Baris × 6 Lantai)")
-st.caption("Zonasi 85% Ketat • 15% Fleksibel • Picking & Printable Invoice • Local AI Ready")
+st.caption("Zonasi 85% Ketat • 15% Fleksibel • Auto-Assign AI • Picking & Printable Invoice")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1. Input Lokasi Rak SKU",
     "2. Peta Visual Rak (8×6)",
-    "3. Tanya AI (Local AI)",
-    "4. Prediksi Rak Barang Masuk",
-    "5. Ambil Barang & Invoice",
-    "6. Import Excel / CSV",
-    "7. Memori & Aturan AI"
+    "3. Asisten & Prediksi AI",
+    "4. Ambil Barang & Invoice",
+    "5. Import Excel / CSV",
+    "6. Memori & Aturan AI"
 ])
 
 # --- TAB 1: INPUT & PEMETAAN RAK ---
 with tab1:
     st.subheader("Hubungkan Kode Produk Mekari Jurnal ke Rak (Baris 1–8, Lantai 1–6)")
-    st.info("🔒 **Sistem 85% Ketat (Zonasi Aktif):** Pelanggaran zonasi diblokir otomatis. Gunakan *15% Fleksibel (Override)* jika ada kebutuhan operasional khusus.")
+    st.info("🔒 **Sistem 85% Ketat (Zonasi Aktif):** Pelanggaran zonasi diblokir otomatis. Centang **Auto-Assign AI** jika ingin AI memilihkan rak kosong terbaik secara otomatis.")
     
     with st.form("add_sku_form", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
@@ -180,10 +229,15 @@ with tab1:
         name = col2.text_input("Nama Produk (sesuai Jurnal)", placeholder="Contoh: Raket Badminton Yonex")
         cat = col3.text_input("Kategori Barang", placeholder="Contoh: Olahraga / Raket")
 
+        auto_mode = st.checkbox(
+            "🤖 Auto-Assign Lokasi Rak oleh AI (Otomatis pilih Baris & Lantai kosong sesuai zonasi & memori)",
+            value=True
+        )
+
         col4, col5, col6, col7 = st.columns([1, 1, 1.5, 2])
-        row_num = col4.selectbox("Baris (Row)", list(range(1, 9)), format_func=lambda x: f"Baris {x:02d}")
+        row_num = col4.selectbox("Baris (Manual)", list(range(1, 9)), format_func=lambda x: f"Baris {x:02d}")
         floor_num = col5.selectbox(
-            "Lantai / Tingkat",
+            "Lantai (Manual)",
             list(range(1, 7)),
             format_func=lambda x: f"Lantai {x} {'(Bawah)' if x == 1 else '(Atas)' if x == 6 else ''}"
         )
@@ -196,7 +250,7 @@ with tab1:
         notes = col7.text_input("Catatan Fisik", placeholder="Contoh: Dus besar, butuh tangga jika lantai 5-6")
 
         st.divider()
-        flex_expander = st.expander("🔓 15% Fleksibel: Opsi Pengecualian / Override Supervisor")
+        flex_expander = st.expander("🔓 15% Fleksibel: Opsi Pengecualian / Override Supervisor (Khusus Input Manual)")
         with flex_expander:
             allow_override = st.checkbox("Izinkan Penempatan di Luar Aturan Zonasi (Pengecualian)")
             override_reason = st.text_input("Alasan Pengecualian (Wajib diisi jika dicentang):", placeholder="Contoh: Rak bawah penuh, titip sementara 1 hari")
@@ -204,6 +258,22 @@ with tab1:
         if st.form_submit_button("Simpan Lokasi Rak"):
             if not sku.strip():
                 st.warning("Harap isi Kode Produk Jurnal (SKU).")
+            elif auto_mode:
+                with st.spinner("🤖 AI sedang mencari & menetapkan slot rak terbaik..."):
+                    assigned_r, assigned_f, assign_msg = auto_assign_bin(
+                        sku.strip(), name.strip(), cat.strip(), speed, notes.strip()
+                    )
+                if assigned_r is None:
+                    st.error(f"⛔ **Gagal Auto-Assign:** {assign_msg}")
+                else:
+                    bin_code = f"R{assigned_r:02d}-L{assigned_f}"
+                    conn.execute(
+                        "INSERT OR REPLACE INTO bin_map VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (sku.strip(), name.strip(), cat.strip(), assigned_r, assigned_f, bin_code, speed, notes.strip())
+                    )
+                    conn.commit()
+                    log_activity("AUTO_ASSIGN_RAK", f"{sku.strip()} ({name.strip()}) -> {bin_code} | {assign_msg}")
+                    st.success(f"🤖 **Berhasil Auto-Assign:** `{sku.strip()}` → **{bin_code}** (Baris {assigned_r}, Lantai {assigned_f})\n\n_{assign_msg}_")
             else:
                 bin_code = f"R{row_num:02d}-L{floor_num}"
                 is_allowed, block_reason = validate_placement_against_rules(
@@ -214,7 +284,7 @@ with tab1:
                     log_activity("DITOLAK_ZONASI", f"{sku.strip()} ({name.strip()}) ke {bin_code}: {block_reason}")
                     st.error(
                         f"⛔ **Penempatan Ditolak (85% Aturan Ketat):** {block_reason}\n\n"
-                        "💡 *Tip fleksibilitas (15%):* Jika ini adalah kasus darurat/pengecualian, buka expander **15% Fleksibel** di atas dan isi alasan override."
+                        "💡 *Tip:* Centang **Auto-Assign Lokasi Rak oleh AI** di atas, atau buka **15% Fleksibel** jika ini kasus darurat."
                     )
                 else:
                     if not is_allowed and allow_override:
@@ -279,14 +349,23 @@ with tab2:
     grid_df = pd.DataFrame(grid_data, index=[f"Lantai {f}" for f in range(6, 0, -1)])
     st.dataframe(grid_df, width="stretch", height=260)
 
-# --- TAB 3: TANYA AI (CHAT + MEMORI PERSISTEN) ---
+# --- TAB 3: GABUNGAN TANYA AI, MEMORI & PREDIKSI RAK BARANG MASUK ---
 with tab3:
-    st.subheader("Asisten Gudang AI (Local AI + Memori Permanen)")
+    st.subheader("🤖 Asisten Gudang & Prediksi Penempatan Rak (Local AI)")
     _, active_model_preview, ai_status = get_ai_client_and_model()
     st.caption(f"Status Koneksi AI: **{ai_status}** • Model: `{active_model_preview}`")
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+
+    with st.expander("📦 Prediksi Cepat Rak untuk Barang Baru Masuk (Slotting)", expanded=False):
+        p_col1, p_col2 = st.columns([3, 1])
+        new_item_input = p_col1.text_input(
+            "Deskripsi & Jumlah Barang Masuk:",
+            placeholder="Contoh: 15 dus sepatu roda inline skate, berat total 250kg",
+            key="quick_slotting_input"
+        )
+        predict_clicked = p_col2.button("Prediksi Slot Terbaik", width="stretch")
 
     col_reset, _ = st.columns([1, 4])
     if col_reset.button("🧹 Reset Obrolan Sesi Ini"):
@@ -297,15 +376,25 @@ with tab3:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    user_prompt = st.chat_input("Tanya lokasi barang, riwayat pindah rak, atau ketik 'Ingat: ...'")
-    if user_prompt:
-        st.session_state.chat_history.append({"role": "user", "content": user_prompt})
-        with st.chat_message("user"):
-            st.markdown(user_prompt)
+    chat_input_val = st.chat_input("Tanya lokasi barang, minta rekomendasi rak barang masuk, atau ketik 'Ingat: ...'")
 
-        lower_prompt = user_prompt.strip().lower()
+    active_prompt = None
+    if predict_clicked:
+        if not new_item_input.strip():
+            st.warning("Isi deskripsi barang masuk terlebih dahulu.")
+        else:
+            active_prompt = f"Rekomendasikan 1 slot rak terbaik untuk barang baru masuk berikut ini: {new_item_input.strip()}"
+    elif chat_input_val:
+        active_prompt = chat_input_val.strip()
+
+    if active_prompt:
+        st.session_state.chat_history.append({"role": "user", "content": active_prompt})
+        with st.chat_message("user"):
+            st.markdown(active_prompt)
+
+        lower_prompt = active_prompt.lower()
         if lower_prompt.startswith(("ingat:", "ingat bahwa", "catat:")):
-            clean_note = user_prompt.split(":", 1)[-1].strip() if ":" in user_prompt else user_prompt.strip()
+            clean_note = active_prompt.split(":", 1)[-1].strip() if ":" in active_prompt else active_prompt
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
             conn.execute(
                 "INSERT INTO warehouse_memory (category, memory_text, created_at) VALUES (?, ?, ?)",
@@ -318,12 +407,18 @@ with tab3:
             with st.chat_message("assistant"):
                 st.markdown(reply)
         else:
-            inventory_table = df_bins.to_csv(index=False) if not df_bins.empty else "Belum ada data barang."
+            inventory_table = df_bins.to_csv(index=False) if not df_bins.empty else "Semua 48 slot rak masih kosong."
             memory_block = get_memory_context()
 
-            system_msg = f"""Kamu adalah asisten kepala gudang untuk rak 8 Baris (R01-R08) dan 6 Lantai (L1-L6).
-Zonasi wajib: Fast-Moving (Lantai 1-2), Medium (Lantai 3-4), Slow-Moving/Bulky (Lantai 5-6).
-Jawab singkat dan akurat dalam Bahasa Indonesia berdasarkan data rak, aturan zonasi, dan memori gudang.
+            system_msg = f"""Kamu adalah asisten kepala gudang sekaligus perencana penempatan rak (8 Baris R01-R08, 6 Lantai L1-L6).
+Zonasi wajib:
+- Fast-Moving (Laku Cepat): Lantai 1-2 (L1-L2)
+- Medium (Normal): Lantai 3-4 (L3-L4)
+- Slow-Moving / Bulky / Berat: Lantai 5-6 (L5-L6)
+
+Tugasmu:
+1. Jika pengguna menanyakan lokasi barang, stok, atau riwayat gudang, jawab singkat dan akurat berdasarkan DATA RAK dan RIWAYAT AKTIVITAS.
+2. Jika pengguna meminta rekomendasi/prediksi rak untuk barang baru masuk, patuhi aturan zonasi dan ATURAN GUDANG di bawah, pilih 1 Kode Rak kosong terbaik (format R0X-LX), dan berikan 2 alasan singkat dalam Bahasa Indonesia.
 
 {memory_block}
 
@@ -333,7 +428,7 @@ DATA RAK SAAT INI:
             recent_messages = [{"role": "system", "content": system_msg}] + st.session_state.chat_history[-6:]
 
             with st.chat_message("assistant"):
-                with st.spinner("Memeriksa database & memori dengan Local AI..."):
+                with st.spinner("Memproses permintaan dengan Local AI..."):
                     try:
                         client, active_model, _ = get_ai_client_and_model()
                         res = client.chat.completions.create(
@@ -348,61 +443,11 @@ DATA RAK SAAT INI:
                     except Exception as e:
                         st.error(
                             f"Gagal terhubung ke Local AI Server: {e}\n\n"
-                            "Pastikan **LM Studio** (port `1234`) atau **Jan AI** (port `1337`) sudah dijalankan dan Local Server dalam status **Start**."
+                            "Pastikan di **LM Studio** / **Jan AI**, model yang dimuat adalah model Chat/Instruct (bukan model `embed`) dan reload model jika muncul error `logits computation`."
                         )
 
-# --- TAB 4: PREDIKSI PENEMPATAN RAK BARANG MASUK ---
+# --- TAB 4: AMBIL BARANG DARI RAK & PRINTABLE INVOICE ---
 with tab4:
-    st.subheader("Prediksi Rak Terbaik untuk Barang Baru Masuk")
-    new_item = st.text_input(
-        "Deskripsi & Jumlah Barang Masuk:",
-        placeholder="Contoh: 15 dus meja ping pong lipat, berat total 300kg"
-    )
-    if st.button("Prediksi Lokasi Rak"):
-        if not new_item.strip():
-            st.warning("Isi deskripsi barang masuk terlebih dahulu.")
-        else:
-            inventory_table = (
-                df_bins.to_csv(index=False)
-                if not df_bins.empty
-                else "Semua 48 slot rak masih kosong."
-            )
-            memory_block = get_memory_context()
-
-            slotting_prompt = f"""Kamu adalah perencana rak gudang (8 Baris R01-R08, 6 Lantai L1-L6).
-Zonasi wajib:
-- Fast-Moving: Lantai 1-2 (L1-L2)
-- Medium: Lantai 3-4 (L3-L4)
-- Slow-Moving / Bulky / Berat: Lantai 5-6 (L5-L6)
-
-Patuhi zonasi ini dan ATURAN GUDANG di bawah ini. Pilih 1 Kode Rak kosong terbaik (format R0X-LX) sesuai perputarannya dan beri 2 alasan singkat dalam Bahasa Indonesia.
-
-{memory_block}
-
-Rak terisi saat ini:
-{inventory_table}"""
-
-            with st.spinner("Menghitung slot terbaik menggunakan Local AI..."):
-                try:
-                    client, active_model, _ = get_ai_client_and_model()
-                    res = client.chat.completions.create(
-                        model=active_model,
-                        temperature=0.2,
-                        max_tokens=300,
-                        messages=[
-                            {"role": "system", "content": slotting_prompt},
-                            {"role": "user", "content": new_item}
-                        ]
-                    )
-                    st.success(res.choices[0].message.content)
-                except Exception as e:
-                    st.error(
-                        f"Gagal terhubung ke Local AI Server: {e}\n\n"
-                        "Pastikan **LM Studio** (port `1234`) atau **Jan AI** (port `1337`) sudah aktif."
-                    )
-
-# --- TAB 5: AMBIL BARANG DARI RAK & PRINTABLE INVOICE ---
-with tab5:
     st.subheader("🛒 Pengambilan Barang (Picking) & Cetak Invoice / Surat Jalan")
     pick_df = pd.read_sql_query(
         "SELECT jurnal_sku, product_name, category, row_num, floor_num, bin_location, notes FROM bin_map ORDER BY row_num, floor_num",
@@ -678,8 +723,8 @@ with tab5:
                     mime="text/csv"
                 )
 
-# --- TAB 6: IMPORT DATA LAMA (EXCEL / CSV) ---
-with tab6:
+# --- TAB 5: IMPORT DATA LAMA (EXCEL / CSV) ---
+with tab5:
     st.subheader("Import Data Massal dari WMS Lama / Excel / Mekari Jurnal")
     st.markdown(
         "Unggah file **.xlsx** atau **.csv** dengan kolom wajib: "
@@ -764,8 +809,8 @@ with tab6:
         except Exception as e:
             st.error(f"Gagal membaca file: {e}")
 
-# --- TAB 7: MEMORI & ATURAN AI ---
-with tab7:
+# --- TAB 6: MEMORI & ATURAN AI ---
+with tab6:
     st.subheader("🧠 Memori Permanen & Aturan Khusus Gudang")
     st.caption("Semua catatan di sini disimpan di SQLite dan otomatis diperiksa saat input barang maupun tanya AI.")
 
