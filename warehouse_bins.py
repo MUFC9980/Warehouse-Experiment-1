@@ -241,6 +241,11 @@ conn.execute("""
         actor TEXT
     )
 """)
+# Safe migration for legacy databases missing the 'actor' column in activity_log
+act_cols = [row[1] for row in conn.execute("PRAGMA table_info(activity_log)").fetchall()]
+if "actor" not in act_cols:
+    conn.execute("ALTER TABLE activity_log ADD COLUMN actor TEXT DEFAULT 'System'")
+
 conn.commit()
 
 def log_activity(action: str, details: str, actor: str | None = None):
