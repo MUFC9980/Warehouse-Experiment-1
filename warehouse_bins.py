@@ -7,7 +7,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 from openai import OpenAI
 
-# --- 0. SUPERVISOR PASSCODE CONFIG ---
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="Warehouse Efficiency System - Jurnal AI", page_icon="📦", layout="wide")
+
+# --- 0. SUPERVISOR PASSCODE & 8 USER ACCOUNTS CONFIG ---
 def get_supervisor_pin() -> str:
     try:
         if "SUPERVISOR_PIN" in st.secrets:
@@ -17,6 +20,51 @@ def get_supervisor_pin() -> str:
     return os.getenv("SUPERVISOR_PIN", "8899").strip()
 
 SUPERVISOR_PIN = get_supervisor_pin()
+
+# 8 Accounts (Username: {"pin": "...", "display": "...", "role": "..."})
+USER_ACCOUNTS = {
+    "david":   {"pin": SUPERVISOR_PIN, "display": "David (Supervisor)",   "role": "Supervisor"},
+    "hartono": {"pin": SUPERVISOR_PIN, "display": "Hartono (Director)",   "role": "Supervisor"},
+    "admin":   {"pin": "1111",         "display": "Admin Gudang",         "role": "Admin"},
+    "budi":    {"pin": "2222",         "display": "Budi (Staff Gudang)",  "role": "Staff"},
+    "andi":    {"pin": "3333",         "display": "Andi (Staff Gudang)",  "role": "Staff"},
+    "siti":    {"pin": "4444",         "display": "Siti (Admin Stok)",    "role": "Staff"},
+    "eko":     {"pin": "5555",         "display": "Eko (Picker)",         "role": "Staff"},
+    "rudi":    {"pin": "6666",         "display": "Rudi (Checker)",       "role": "Staff"},
+}
+
+# --- AUTHENTICATION / SIGN-IN GATE ---
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "current_user" not in st.session_state:
+    st.session_state.current_user = ""
+if "current_role" not in st.session_state:
+    st.session_state.current_role = ""
+
+if not st.session_state.authenticated:
+    col_l, col_mid, col_r = st.columns([1, 1.5, 1])
+    with col_mid:
+        st.title("🔐 Warehouse Efficiency System")
+        st.markdown("Silakan masukkan **Username** dan **PIN** untuk masuk ke sistem gudang.")
+        
+        with st.form("login_form"):
+            entered_user = st.text_input("Username", placeholder="Contoh: david, budi, admin...")
+            entered_pin = st.text_input("Passcode / PIN", type="password", placeholder="Masukkan PIN...")
+            submit_login = st.form_submit_button("Masuk ke Program", use_container_width=True)
+            
+            if submit_login:
+                uname = entered_user.strip().lower()
+                upin = entered_pin.strip()
+                if uname in USER_ACCOUNTS and USER_ACCOUNTS[uname]["pin"] == upin:
+                    st.session_state.authenticated = True
+                    st.session_state.current_user = USER_ACCOUNTS[uname]["display"]
+                    st.session_state.current_role = USER_ACCOUNTS[uname]["role"]
+                    st.success(f"Selamat datang, {st.session_state.current_user}! Memuat sistem...")
+                    st.rerun()
+                else:
+                    st.error("Username atau PIN salah! Silakan periksa kembali.")
+    
+    st.stop()
 
 # --- 1. LOCAL AI CONNECTION SETUP ---
 def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
@@ -118,11 +166,12 @@ conn.execute("""
 """)
 conn.commit()
 
-def log_activity(action: str, details: str, actor: str = "System"):
+def log_activity(action: str, details: str, actor: str | None = None):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    active_actor = actor if actor else st.session_state.get("current_user", "System")
     conn.execute(
         "INSERT INTO activity_log (timestamp, action, details, actor) VALUES (?, ?, ?, ?)",
-        (now, action, details, actor)
+        (now, action, details, active_actor)
     )
     conn.commit()
 
@@ -284,7 +333,7 @@ def evaluate_override_reason_with_ai(
             audit_prompt = f"""Auditor Kepala Gudang. Nilai apakah alasan 15% override logis.
 PRODUK: {sku} — {name} ({qty_desc}, {speed})
 TUJUAN: {target_bin} | PELANGGARAN: {block_reason}
- FAKTA GUDANG: {valid_info}
+FAKTA GUDANG: {valid_info}
 ALASAN STAF: "{override_reason}"
 
 Awali baris pertama dengan tepat:
@@ -330,7 +379,7 @@ def auto_assign_bin(
     try:
         client, active_model, status = get_ai_client_and_model()
         if not status.startswith("Offline"):
-            prompt = f"Pilih 1 kode rak terbaik untuk {sku} - {name}. Kandidat: {', '.join(candidate_labels)}. Balas HANYA dengan kode rak (misal R01-L1)."
+            prompt = f"Pilih 1 kode rak terbaik untuk {sku} {name}. Kandidat: {', '.join(candidate_labels)}. Balas HANYA dengan kode rak (misal R01-L1)."
             res = client.chat.completions.create(model=active_model, temperature=0.1, max_tokens=50, messages=[{"role": "user", "content": prompt}])
             match = re.search(r"R0([1-8])-L([1-6])", res.choices[0].message.content.upper())
             if match:
@@ -344,8 +393,16 @@ def auto_assign_bin(
     return best_r, best_f, f"Otomatis ke slot paling longgar ({best_code})."
 
 # --- 3. STREAMLIT APP & UI ---
-st.set_page_config(page_title="Sistem Rak Gudang 8x6 - Jurnal AI", layout="wide")
-st.title("📦 Sistem Lokasi Rak Gudang (8 Baris × 6 Lantai)")
+head_col1, head_col2 = st.columns([4, 1])
+with head_col1:
+    st.title("📦 Warehouse Efficiency System")
+with head_col2:
+    st.markdown(f"**👤 {st.session_state.current_user}**")
+    if st.button("🚪 Keluar / Logout", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.current_user = ""
+        st.session_state.current_role = ""
+        st.rerun()
 
 stats_now = get_warehouse_stats()
 st.caption(f"Zonasi 85% • 15% Fleksibel • 10.000+ SKU Ready | Stok: **{stats_now['total_skus']:,} SKU** | **{stats_now['occupied_bins']}/48 Slot Terisi**")
@@ -368,7 +425,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
 
 # --- TAB 1: INPUT & PEMETAAN RAK ---
 with tab1:
-    st.subheader("Hubungkan SKU Mekari Jurnal ke Rak")
+    st.subheader("📥 Input Barang Masuk")
     with st.form("add_sku_form", clear_on_submit=False):
         c1, c2, c3 = st.columns(3)
         sku = c1.text_input("Kode SKU Jurnal", placeholder="JRN-1042")
@@ -404,7 +461,6 @@ with tab1:
             else:
                 pcs_val = int(pcs_per_box) if int(pcs_per_box) > 0 else None
                 exp_str = expiry_val.strftime("%Y-%m-%d") if expiry_val else None
-                qty_lbl = format_qty_summary(int(box_qty), pcs_val)
 
                 if auto_mode:
                     with st.spinner("AI memilih slot terbaik..."):
@@ -418,7 +474,7 @@ with tab1:
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (sku.strip(), name.strip(), cat.strip(), ar, af, b_code, speed, notes.strip(), int(box_qty), pcs_val, int(min_thresh), exp_str))
                         conn.commit()
-                        log_activity("AUTO_ASSIGN", f"{sku.strip()} -> {b_code}", actor="System")
+                        log_activity("AUTO_ASSIGN", f"{sku.strip()} -> {b_code}")
                         st.success(f"Berhasil Auto-Assign `{sku.strip()}` → **{b_code}** ({msg})")
                 else:
                     b_code = f"R{row_num:02d}-L{floor_num}"
@@ -440,7 +496,7 @@ with tab1:
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                 (sku.strip(), name.strip(), cat.strip(), row_num, floor_num, b_code, speed, notes.strip(), int(box_qty), pcs_val, int(min_thresh), exp_str))
                             conn.commit()
-                            log_activity("OVERRIDE_APPROVED", f"{sku.strip()} ke {b_code}", actor="Supervisor")
+                            log_activity("OVERRIDE_APPROVED", f"{sku.strip()} ke {b_code}")
                             st.success(f"Override Disetujui AI: `{sku.strip()}` → **{b_code}**\n\n**Audit AI:** {ai_fb}")
                         else:
                             st.session_state.pending_force_override = {
@@ -456,7 +512,7 @@ with tab1:
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (sku.strip(), name.strip(), cat.strip(), row_num, floor_num, b_code, speed, notes.strip(), int(box_qty), pcs_val, int(min_thresh), exp_str))
                         conn.commit()
-                        log_activity("SIMPAN_RAK", f"{sku.strip()} -> {b_code}", actor="Staff")
+                        log_activity("SIMPAN_RAK", f"{sku.strip()} -> {b_code}")
                         st.success(f"Berhasil menyimpan: `{sku.strip()}` → **{b_code}**")
 
     if st.session_state.pending_force_override:
@@ -469,7 +525,7 @@ with tab1:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (pfo["sku"], pfo["name"], pfo["cat"], pfo["row_num"], pfo["floor_num"], pfo["bin_code"], pfo["speed"], pfo["notes"], pfo["box_qty"], pfo["pcs_val"], pfo["min_thresh"], pfo["exp_str"]))
             conn.commit()
-            log_activity("FORCE_OVERRIDE", f"Force save {pfo['sku']} to {pfo['bin_code']}", actor="Supervisor")
+            log_activity("FORCE_OVERRIDE", f"Force save {pfo['sku']} to {pfo['bin_code']}")
             st.session_state.pending_force_override = None
             st.success("Tersimpan dengan Force Override.")
             st.rerun()
@@ -499,7 +555,7 @@ with tab2:
     audit_items = pd.read_sql_query("SELECT jurnal_sku, product_name, bin_location, box_qty FROM bin_map WHERE row_num = ? ORDER BY floor_num", conn, params=[audit_row])
     
     if audit_items.empty:
-        st.info(f"Baris 02 kosong.")
+        st.info(f"Baris {audit_row:02d} kosong.")
     else:
         st.write(f"Ditemukan **{len(audit_items)}** SKU di Baris {audit_row:02d}. Masukkan hasil hitung fisik:")
         discrepancies = []
@@ -521,7 +577,7 @@ with tab2:
                 else:
                     conn.execute("UPDATE bin_map SET box_qty = ? WHERE jurnal_sku = ?", (phys_q, sku_id))
             conn.commit()
-            log_activity("CYCLE_COUNT_AUDIT", f"Audit Baris {audit_row:02d} disinkronkan. Koreksi {len(discrepancies)} item.", actor="Auditor")
+            log_activity("CYCLE_COUNT_AUDIT", f"Audit Baris {audit_row:02d} disinkronkan. Koreksi {len(discrepancies)} item.")
             st.success("Stok opname berhasil disinkronkan dengan database!")
             st.rerun()
 
@@ -562,7 +618,7 @@ with tab4:
             sel_rows = pick_df[pick_df["label"].isin(sel)]
             picked_items = []
             inv_no = st.text_input("No. Surat Jalan", value=f"SJ-{datetime.now().strftime('%Y%m%d-%H%M')}")
-            picker = st.text_input("Nama Picker", placeholder="Budi")
+            picker = st.text_input("Nama Picker", value=st.session_state.current_user)
             
             for _, r in sel_rows.iterrows():
                 c1, c2, c3 = st.columns([2, 1, 1])
@@ -579,7 +635,7 @@ with tab4:
                     else:
                         conn.execute("UPDATE bin_map SET box_qty = ? WHERE jurnal_sku = ?", (rem, it["sku"]))
                 conn.commit()
-                log_activity("PICKING", f"Picking {inv_no} oleh {picker} untuk {len(picked_items)} SKU", actor=picker or "Picker")
+                log_activity("PICKING", f"Picking {inv_no} oleh {picker} untuk {len(picked_items)} SKU", actor=picker)
                 st.success(f"Surat Jalan **{inv_no}** berhasil diterbitkan dan stok dipotong otomatis!")
 
 # --- TAB 5: REORDER ALERTS ---
@@ -617,7 +673,7 @@ with tab7:
                 records.append((str(row["jurnal_sku"]), str(row["product_name"]), str(row.get("category", "")), int(row["row_num"]), int(row["floor_num"]), f"R{int(row['row_num']):02d}-L{int(row['floor_num'])}", str(row.get("turnover_speed", "Medium (Normal)")), str(row.get("notes", "")), int(row.get("box_qty", 1)), int(row.get("pcs_per_box", 0)) if pd.notna(row.get("pcs_per_box")) else None, 3, None))
             conn.executemany("INSERT OR REPLACE INTO bin_map (jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold, expiry_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", records)
             conn.commit()
-            log_activity("IMPORT_MASSAL", f"Import {len(records)} SKU", actor="Admin")
+            log_activity("IMPORT_MASSAL", f"Import {len(records)} SKU")
             st.success(f"Berhasil mengimpor {len(records)} SKU!")
 
 # --- TAB 8: MEMORI & LEADERBOARD (PASSCODE PROTECTED) ---
