@@ -299,6 +299,113 @@ def validate_placement_against_rules(
 
     return True, ""
 
+def evaluate_override_reason_with_ai(
+    sku: str,
+    name: str,
+    cat: str,
+    row_num: int,
+    floor_num: int,
+    speed: str,
+    notes: str,
+    box_qty: int,
+    pcs_per_box: int | None,
+    block_reason: str,
+    override_reason: str
+) -> tuple[bool, str]:
+    """Audits whether the employee's 15% override explanation makes operational sense against real warehouse state."""
+    target_bin = f"R{row_num:02d}-L{floor_num}"
+    qty_desc = format_qty_summary(box_qty, pcs_per_box)
+
+    # Check actual empty/valid slots so AI can verify claims like "rak bawah penuh"
+    slot_counts_df = pd.read_sql_query(
+        "SELECT row_num, floor_num, COUNT(*) AS cnt, COALESCE(SUM(box_qty), 0) AS boxes FROM bin_map GROUP BY row_num, floor_num",
+        conn
+    )
+    occupancy_map = {
+        (int(r["row_num"]), int(r["floor_num"])): (int(r["cnt"]), int(r["boxes"]))
+        for _, r in slot_counts_df.iterrows()
+    }
+
+    valid_empty_bins = []
+    valid_light_bins = []
+    for r in range(1, 9):
+        for f in range(1, 7):
+            ok, _ = validate_placement_against_rules(sku, name, cat, r, f, speed, notes)
+            if ok:
+                cnt, boxes = occupancy_map.get((r, f), (0, 0))
+                if cnt == 0:
+                    valid_empty_bins.append(f"R{r:02d}-L{f}")
+                elif boxes <= 5:
+                    valid_light_bins.append(f"R{r:02d}-L{f}({boxes} dus)")
+
+    memory_block = get_memory_context()
+
+    # Deterministic sanity check for gibberish / ultra-short excuses
+    cleaned = override_reason.strip()
+    if len(cleaned) < 6 or len(set(cleaned.lower())) <= 3:
+        alt_hint = f"Slot kosong sesuai zonasi yang tersedia: {', '.join(valid_empty_bins[:6])}." if valid_empty_bins else ""
+        return (
+            False,
+            f"**Alasan Kurang Masuk Akal:** Penjelasan terlalu singkat atau tidak jelas (`\"{cleaned}\"`). "
+            f"Staf wajib menuliskan alasan operasional yang spesifik (misalnya kendala ukuran fisik, kerusakan rak, atau instruksi pengiriman mendadak). {alt_hint}"
+        )
+
+    try:
+        client, active_model, status = get_ai_client_and_model()
+        if not status.startswith("Offline"):
+            valid_info = (
+                f"Slot kosong yang SEBENARNYA tersedia dan sesuai aturan zonasi: {', '.join(valid_empty_bins[:10])}"
+                if valid_empty_bins
+                else f"Tidak ada slot benar-benar kosong di zona wajib, slot paling longgar: {', '.join(valid_light_bins[:6])}"
+            )
+
+            audit_prompt = f"""Kamu adalah Auditor Kepala Gudang yang ketat namun objektif. Tugasmu menilai apakah alasan staf untuk melanggar aturan zonasi (15% Override) MASUK AKAL atau TIDAK MASUK AKAL berdasarkan fakta nyata gudang.
+
+DATA BARANG & PENEMPATAN:
+- Produk: {sku} — {name} (Kategori: {cat}, Jumlah: {qty_desc}, Perputaran: {speed}, Catatan: {notes})
+- Rak Tujuan yang Dipaksa: {target_bin} (Baris {row_num}, Lantai {floor_num})
+- Aturan Zonasi yang Dilanggar: {block_reason}
+- Fakta Ketersediaan Rak Saat Ini: {valid_info}
+- Alasan yang Ditulis Staf: "{override_reason}"
+
+{memory_block}
+
+INSTRUKSI PENILAIAN:
+1. Periksa apakah alasan staf logis secara operasional dan tidak bertentangan dengan fakta gudang (contoh: jika staf beralasan "rak bawah penuh" padahal masih banyak slot kosong di zona wajib, atau alasan asal-asalan seperti "biar cepat"/"malas naik tangga"/"terserah", maka TIDAK MASUK AKAL).
+2. Awali jawabanmu PERSIS dengan salah satu label berikut di baris pertama:
+   STATUS: MASUK AKAL
+   atau
+   STATUS: KURANG MASUK AKAL
+3. Di bawahnya, berikan umpan balik 2–3 kalimat dalam Bahasa Indonesia:
+   - Jika MASUK AKAL: jelaskan singkat mengapa pengecualian ini dapat diterima dan hal yang perlu diperhatikan staf.
+   - Jika KURANG MASUK AKAL: jelaskan secara spesifik mengapa alasan tersebut tidak masuk akal atau bertentangan dengan kondisi gudang, lalu sarankan kode rak alternatif yang lebih tepat."""
+
+            res = client.chat.completions.create(
+                model=active_model,
+                temperature=0.1,
+                max_tokens=220,
+                messages=[{"role": "user", "content": audit_prompt}]
+            )
+            reply = res.choices[0].message.content.strip()
+            first_line = reply.splitlines()[0].upper() if reply else ""
+            is_logical = "MASUK AKAL" in first_line and "KURANG" not in first_line and "TIDAK" not in first_line
+            cleaned_feedback = "\n".join(reply.splitlines()[1:]).strip() if len(reply.splitlines()) > 1 else reply
+            return is_logical, cleaned_feedback
+    except Exception:
+        pass
+
+    # Fallback heuristic if Local AI server is offline
+    low_reason = cleaned.lower()
+    if ("penuh" in low_reason or "full" in low_reason) and len(valid_empty_bins) >= 3:
+        return (
+            False,
+            f"**Alasan Kurang Masuk Akal (Cek Data Gudang):** Anda menulis alasan *\"{override_reason}\"*, "
+            f"tetapi sistem mendeteksi masih ada **{len(valid_empty_bins)} slot kosong** yang sesuai zonasi "
+            f"(contoh: {', '.join(valid_empty_bins[:5])}). Gunakan slot kosong tersebut terlebih dahulu."
+        )
+
+    return True, f"Passcode valid. Alasan dicatat (Mode Offline AI): *\"{override_reason}\"*"
+
 def auto_assign_bin(
     sku: str, name: str, cat: str, speed: str, notes: str, box_qty: int, pcs_per_box: int | None
 ) -> tuple[int | None, int | None, str]:
@@ -367,13 +474,15 @@ st.title("📦 Sistem Lokasi Rak Gudang (8 Baris × 6 Lantai)")
 
 stats_now = get_warehouse_stats()
 st.caption(
-    f"Zonasi 85% Ketat • 15% Fleksibel (PIN Supervisor) • Skala 10.000+ SKU Ready | "
+    f"Zonasi 85% Ketat • 15% Fleksibel (PIN Supervisor + Audit AI) • Skala 10.000+ SKU Ready | "
     f"📊 Total Stok: **{stats_now['total_skus']:,} SKU** • **{stats_now['total_boxes']:,} Dus** • "
     f"**{stats_now['occupied_bins']}/48 Slot Terisi**"
 )
 
 if "tab6_unlocked" not in st.session_state:
     st.session_state.tab6_unlocked = False
+if "pending_force_override" not in st.session_state:
+    st.session_state.pending_force_override = None
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1. Input Lokasi Rak SKU",
@@ -389,7 +498,7 @@ with tab1:
     st.subheader("Hubungkan Kode Produk Mekari Jurnal ke Rak (Baris 1–8, Lantai 1–6)")
     st.info("🔒 **Sistem 85% Ketat (Zonasi Aktif):** Pelanggaran zonasi diblokir otomatis. Centang **Auto-Assign AI** agar AI memilihkan slot paling longgar sesuai zonasi.")
     
-    with st.form("add_sku_form", clear_on_submit=True):
+    with st.form("add_sku_form", clear_on_submit=False):
         col1, col2, col3 = st.columns(3)
         sku = col1.text_input("Kode Produk Jurnal (SKU)", placeholder="Contoh: JRN-1042")
         name = col2.text_input("Nama Produk (sesuai Jurnal)", placeholder="Contoh: Raket Badminton Yonex")
@@ -426,13 +535,13 @@ with tab1:
         notes = col6.text_input("Catatan Fisik", placeholder="Contoh: Dus besar, butuh tangga jika lantai 5-6")
 
         st.divider()
-        flex_expander = st.expander("🔐 15% Fleksibel: Opsi Pengecualian / Override Supervisor (Wajib Passcode)")
+        flex_expander = st.expander("🔐 15% Fleksibel: Opsi Pengecualian / Override Supervisor (Wajib Passcode + Audit AI)")
         with flex_expander:
             allow_override = st.checkbox("Izinkan Penempatan di Luar Aturan Zonasi (Pengecualian)")
             ov_col1, ov_col2 = st.columns([2, 1])
             override_reason = ov_col1.text_input(
-                "Alasan Pengecualian (Wajib diisi jika dicentang):",
-                placeholder="Contoh: Rak bawah penuh, titip sementara 1 hari"
+                "Alasan Pengecualian (Akan dianalisis AI setelah PIN diverifikasi):",
+                placeholder="Contoh: Kardus ukuran 120cm tidak muat di tinggi rak L1-L2, hanya muat di L6"
             )
             override_pin_input = ov_col2.text_input(
                 "Passcode Supervisor:",
@@ -441,6 +550,7 @@ with tab1:
             )
 
         if st.form_submit_button("Simpan Lokasi Rak"):
+            st.session_state.pending_force_override = None
             if not sku.strip():
                 st.warning("Harap isi Kode Produk Jurnal (SKU).")
             else:
@@ -475,20 +585,70 @@ with tab1:
                         log_activity("DITOLAK_ZONASI", f"{sku.strip()} ({name.strip()}) ke {bin_code}: {block_reason}")
                         st.error(
                             f"⛔ **Penempatan Ditolak (85% Aturan Ketat):** {block_reason}\n\n"
-                            "💡 *Tip:* Centang **Auto-Assign Lokasi Rak oleh AI** di atas, atau buka **15% Fleksibel** dan masukkan Passcode Supervisor."
+                            "💡 *Tip:* Centang **Auto-Assign Lokasi Rak oleh AI** di atas, atau buka **15% Fleksibel**, isi alasan, dan masukkan Passcode Supervisor."
                         )
-                    else:
-                        if not is_allowed and allow_override:
-                            if not override_reason.strip():
-                                st.warning("⚠️ Anda mencentang override, tetapi **Alasan Pengecualian** belum diisi!")
-                                st.stop()
-                            if override_pin_input.strip() != SUPERVISOR_PIN:
-                                log_activity("GAGAL_PIN_OVERRIDE", f"Percobaan override ditolak (PIN salah) untuk {sku.strip()} ke {bin_code}")
-                                st.error("🔐 **Passcode Supervisor Salah!** Pengecualian 15% dibatalkan.")
-                                st.stop()
-                            log_activity("OVERRIDE_ZONASI", f"OVERRIDE disetujui (PIN valid) untuk {sku.strip()} ke {bin_code}. Alasan: {override_reason}")
-                            st.warning(f"⚠️ **Pengecualian 15% Diterapkan (Override):** Menyimpan ke {bin_code} meskipun melanggar zonasi. Alasan tercatat: *{override_reason}*")
+                    elif not is_allowed and allow_override:
+                        if not override_reason.strip():
+                            st.warning("⚠️ Anda mencentang override, tetapi **Alasan Pengecualian** belum diisi!")
+                            st.stop()
+                        if override_pin_input.strip() != SUPERVISOR_PIN:
+                            log_activity("GAGAL_PIN_OVERRIDE", f"Percobaan override ditolak (PIN salah) untuk {sku.strip()} ke {bin_code}")
+                            st.error("🔐 **Passcode Supervisor Salah!** Pengecualian 15% dibatalkan.")
+                            st.stop()
 
+                        # Passcode verified -> AI evaluates whether the reasoning makes operational sense
+                        with st.spinner("🤖 Passcode terverifikasi. AI sedang menganalisis kelogisan alasan pengecualian..."):
+                            reason_ok, ai_feedback = evaluate_override_reason_with_ai(
+                                sku=sku.strip(),
+                                name=name.strip(),
+                                cat=cat.strip(),
+                                row_num=row_num,
+                                floor_num=floor_num,
+                                speed=speed,
+                                notes=notes.strip(),
+                                box_qty=int(box_qty),
+                                pcs_per_box=pcs_val,
+                                block_reason=block_reason,
+                                override_reason=override_reason.strip()
+                            )
+
+                        if reason_ok:
+                            conn.execute(
+                                """INSERT OR REPLACE INTO bin_map
+                                   (jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (sku.strip(), name.strip(), cat.strip(), row_num, floor_num, bin_code, speed, notes.strip(), int(box_qty), pcs_val)
+                            )
+                            conn.commit()
+                            log_activity(
+                                "OVERRIDE_ZONASI_DISETUJUI",
+                                f"{sku.strip()} ke {bin_code} | Alasan: {override_reason.strip()} | Audit AI: MASUK AKAL"
+                            )
+                            st.success(
+                                f"✅ **Pengecualian 15% Disetujui & Tersimpan:** `{sku.strip()}` ({qty_label}) → **{bin_code}**\n\n"
+                                f"**🤖 Umpan Balik Audit AI (Alasan Masuk Akal):**\n{ai_feedback}"
+                            )
+                        else:
+                            log_activity(
+                                "OVERRIDE_DITOLAK_AI",
+                                f"{sku.strip()} ke {bin_code} | Alasan: {override_reason.strip()} | Audit AI: KURANG MASUK AKAL"
+                            )
+                            st.session_state.pending_force_override = {
+                                "sku": sku.strip(),
+                                "name": name.strip(),
+                                "cat": cat.strip(),
+                                "row_num": row_num,
+                                "floor_num": floor_num,
+                                "bin_code": bin_code,
+                                "speed": speed,
+                                "notes": notes.strip(),
+                                "box_qty": int(box_qty),
+                                "pcs_val": pcs_val,
+                                "qty_label": qty_label,
+                                "override_reason": override_reason.strip(),
+                                "ai_feedback": ai_feedback
+                            }
+                    else:
                         conn.execute(
                             """INSERT OR REPLACE INTO bin_map
                                (jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box)
@@ -496,9 +656,39 @@ with tab1:
                             (sku.strip(), name.strip(), cat.strip(), row_num, floor_num, bin_code, speed, notes.strip(), int(box_qty), pcs_val)
                         )
                         conn.commit()
-                        if is_allowed:
-                            log_activity("SIMPAN_RAK", f"{sku.strip()} ({name.strip()}, {qty_label}) -> {bin_code}")
+                        log_activity("SIMPAN_RAK", f"{sku.strip()} ({name.strip()}, {qty_label}) -> {bin_code}")
                         st.success(f"Berhasil menyimpan: {sku.strip()} ({qty_label}) → **{bin_code}** (Baris {row_num}, Lantai {floor_num})")
+
+    # Display AI Audit Warning & Supervisor Force-Save option when reasoning was flagged as illogical
+    if st.session_state.pending_force_override:
+        pfo = st.session_state.pending_force_override
+        st.error(
+            f"⚠️ **Audit AI Menilai Alasan Pengecualian Kurang Masuk Akal** (Penempatan `{pfo['sku']}` ke **{pfo['bin_code']}** ditahan):\n\n"
+            f"{pfo['ai_feedback']}\n\n"
+            f"💡 Silakan perbaiki alasan di atas agar lebih spesifik, pindahkan ke rak saran AI, atau klik tombol di bawah jika Supervisor tetap memutuskan memaksa simpan."
+        )
+        fc1, fc2 = st.columns([1, 1])
+        if fc1.button("🔓 Tetap Paksa Simpan (Keputusan Supervisor)", type="primary"):
+            conn.execute(
+                """INSERT OR REPLACE INTO bin_map
+                   (jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    pfo["sku"], pfo["name"], pfo["cat"], pfo["row_num"], pfo["floor_num"],
+                    pfo["bin_code"], pfo["speed"], pfo["notes"], pfo["box_qty"], pfo["pcs_val"]
+                )
+            )
+            conn.commit()
+            log_activity(
+                "FORCE_OVERRIDE_SUPERVISOR",
+                f"Supervisor memaksa simpan {pfo['sku']} ke {pfo['bin_code']} setelah peringatan AI. Alasan: {pfo['override_reason']}"
+            )
+            st.session_state.pending_force_override = None
+            st.warning(f"⚠️ Tersimpan dengan Force Override Supervisor: `{pfo['sku']}` ({pfo['qty_label']}) → **{pfo['bin_code']}**")
+            st.rerun()
+        if fc2.button("❌ Batalkan Override"):
+            st.session_state.pending_force_override = None
+            st.rerun()
 
     st.divider()
     search_col1, search_col2 = st.columns([3, 1])
