@@ -7,6 +7,18 @@ import streamlit as st
 import streamlit.components.v1 as components
 from openai import OpenAI
 
+# --- 0. SUPERVISOR PASSCODE CONFIG (For 15% Flexibility Override & Tab 6 Memory) ---
+def get_supervisor_pin() -> str:
+    """Reads SUPERVISOR_PIN from Streamlit secrets or env var, defaulting to '8899'."""
+    try:
+        if "SUPERVISOR_PIN" in st.secrets:
+            return str(st.secrets["SUPERVISOR_PIN"]).strip()
+    except Exception:
+        pass
+    return os.getenv("SUPERVISOR_PIN", "8899").strip()
+
+SUPERVISOR_PIN = get_supervisor_pin()
+
 # --- 1. LOCAL AI CONNECTION SETUP (LM Studio 1234 -> Jan AI 1337 -> Optional Cloud Fallback) ---
 def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
     """Connects directly to Local AI (LM Studio 1234 or Jan AI 1337), prioritizing Qwen/Chat models."""
@@ -49,8 +61,12 @@ def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
 
     return OpenAI(base_url="http://127.0.0.1:1337/v1", api_key="not-needed"), "Qwen2.5-3B-Instruct-4bit", "Offline (Server Belum Aktif)"
 
-# --- 2. DATABASE SETUP & MIGRATION (SQLite + Persistent AI Memory) ---
-conn = sqlite3.connect("jurnal_bins.db", check_same_thread=False)
+# --- 2. DATABASE SETUP, WAL CONCURRENCY & 10K-SKU INDEXES ---
+conn = sqlite3.connect("jurnal_bins.db", timeout=15.0, check_same_thread=False)
+conn.execute("PRAGMA journal_mode=WAL;")
+conn.execute("PRAGMA synchronous=NORMAL;")
+conn.execute("PRAGMA temp_store=MEMORY;")
+
 conn.execute("""
     CREATE TABLE IF NOT EXISTS bin_map (
         jurnal_sku TEXT PRIMARY KEY,
@@ -66,12 +82,17 @@ conn.execute("""
     )
 """)
 
-# Safe migration for existing databases created before box_qty / pcs_per_box were added
+# Safe migration for existing databases
 existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(bin_map)").fetchall()]
 if "box_qty" not in existing_cols:
     conn.execute("ALTER TABLE bin_map ADD COLUMN box_qty INTEGER DEFAULT 1")
 if "pcs_per_box" not in existing_cols:
     conn.execute("ALTER TABLE bin_map ADD COLUMN pcs_per_box INTEGER")
+
+# Indexes for fast 10,000+ SKU queries
+conn.execute("CREATE INDEX IF NOT EXISTS idx_bin_location ON bin_map(row_num, floor_num);")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_product_name ON bin_map(product_name);")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON bin_map(category);")
 
 conn.execute("""
     CREATE TABLE IF NOT EXISTS warehouse_memory (
@@ -106,10 +127,28 @@ def format_qty_summary(box_qty: int, pcs_per_box: int | None) -> str:
         return f"{b_qty} dus × {p_qty} pcs ({b_qty * p_qty:,} pcs)".replace(",", ".")
     return f"{b_qty} dus"
 
+def get_warehouse_stats() -> dict:
+    """Fast aggregate query across 10k+ SKUs."""
+    row = conn.execute("""
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(box_qty), 0),
+            COALESCE(SUM(CASE WHEN pcs_per_box IS NOT NULL AND pcs_per_box > 0 THEN box_qty * pcs_per_box ELSE 0 END), 0),
+            COUNT(DISTINCT bin_location)
+        FROM bin_map
+    """).fetchone()
+    return {
+        "total_skus": int(row[0]),
+        "total_boxes": int(row[1]),
+        "total_pcs": int(row[2]),
+        "occupied_bins": int(row[3]),
+        "empty_bins": 48 - int(row[3])
+    }
+
 def get_memory_context() -> str:
     """Fetches saved warehouse rules & recent logs to feed into the AI."""
     mem_df = pd.read_sql_query(
-        "SELECT category, memory_text FROM warehouse_memory ORDER BY id DESC",
+        "SELECT category, memory_text FROM warehouse_memory ORDER BY id DESC LIMIT 30",
         conn
     )
     log_df = pd.read_sql_query(
@@ -130,6 +169,85 @@ def get_memory_context() -> str:
         parts.append(f"RIWAYAT AKTIVITAS TERAKHIR:\n{logs}")
 
     return "\n\n".join(parts) if parts else "Belum ada memori khusus tambahan."
+
+def search_inventory_for_ai(query_text: str, limit: int = 25) -> str:
+    """Retrieves only relevant SKUs + global summary stats so 10,000+ SKUs never overflow AI context."""
+    stats = get_warehouse_stats()
+    summary_header = (
+        f"RINGKASAN TOTAL GUDANG: {stats['total_skus']:,} SKU | "
+        f"{stats['total_boxes']:,} Dus | {stats['total_pcs']:,} Pcs terhitung | "
+        f"{stats['occupied_bins']}/48 Slot Terisi ({stats['empty_bins']} Slot Kosong)."
+    ).replace(",", ".")
+
+    if stats["total_skus"] == 0:
+        return f"{summary_header}\nSemua 48 slot rak masih kosong."
+
+    slot_summary_df = pd.read_sql_query("""
+        SELECT bin_location, COUNT(*) AS sku_count, COALESCE(SUM(box_qty), 0) AS total_dus
+        FROM bin_map
+        GROUP BY bin_location
+        ORDER BY row_num, floor_num
+    """, conn)
+    slot_lines = ", ".join([
+        f"{r['bin_location']}({r['sku_count']} SKU/{int(r['total_dus'])} dus)"
+        for _, r in slot_summary_df.iterrows()
+    ])
+
+    stopwords = {
+        "dimana", "mana", "lokasi", "rak", "barang", "stok", "ada", "berapa", "yang",
+        "untuk", "dari", "dan", "atau", "tolong", "carikan", "cek", "rekomendasi",
+        "prediksi", "slot", "kosong", "masuk", "baru", "jumlah", "dus", "pcs", "ini", "itu"
+    }
+    tokens = [
+        t.strip(".,?!:;()[]\"'")
+        for t in query_text.lower().split()
+        if len(t.strip(".,?!:;()[]\"'")) >= 2 and t.strip(".,?!:;()[]\"'") not in stopwords
+    ]
+
+    if tokens:
+        conditions = []
+        params = []
+        for tok in tokens[:5]:
+            like_pat = f"%{tok}%"
+            conditions.append(
+                "(LOWER(jurnal_sku) LIKE ? OR LOWER(product_name) LIKE ? OR LOWER(category) LIKE ? OR LOWER(bin_location) LIKE ? OR LOWER(notes) LIKE ?)"
+            )
+            params.extend([like_pat, like_pat, like_pat, like_pat, like_pat])
+
+        where_clause = " OR ".join(conditions)
+        matched_df = pd.read_sql_query(
+            f"""SELECT bin_location AS "Rak", jurnal_sku AS "SKU", product_name AS "Produk",
+                       category AS "Kategori", box_qty AS "Dus", pcs_per_box AS "Isi_Dus",
+                       turnover_speed AS "Perputaran", notes AS "Catatan"
+                FROM bin_map
+                WHERE {where_clause}
+                ORDER BY row_num, floor_num
+                LIMIT {limit}""",
+            conn,
+            params=params
+        )
+    else:
+        matched_df = pd.read_sql_query(
+            f"""SELECT bin_location AS "Rak", jurnal_sku AS "SKU", product_name AS "Produk",
+                       category AS "Kategori", box_qty AS "Dus", pcs_per_box AS "Isi_Dus",
+                       turnover_speed AS "Perputaran", notes AS "Catatan"
+                FROM bin_map
+                ORDER BY row_num, floor_num
+                LIMIT {limit}""",
+            conn
+        )
+
+    matched_csv = (
+        matched_df.to_csv(index=False)
+        if not matched_df.empty
+        else "Tidak ada SKU yang cocok langsung dengan kata kunci pertanyaan."
+    )
+
+    return (
+        f"{summary_header}\n"
+        f"KETERISIAN PER SLOT: {slot_lines}\n\n"
+        f"SAMPEL DATA SKU RELEVAN (Maks {limit} hasil):\n{matched_csv}"
+    )
 
 def validate_placement_against_rules(
     sku: str, name: str, cat: str, row_num: int, floor_num: int, speed: str, notes: str
@@ -184,22 +302,34 @@ def validate_placement_against_rules(
 def auto_assign_bin(
     sku: str, name: str, cat: str, speed: str, notes: str, box_qty: int, pcs_per_box: int | None
 ) -> tuple[int | None, int | None, str]:
-    """Finds valid empty slots matching 85% rules and asks Local AI to pick the best one."""
-    occupied_df = pd.read_sql_query("SELECT row_num, floor_num FROM bin_map", conn)
-    occupied_set = set(zip(occupied_df["row_num"], occupied_df["floor_num"]))
+    """Finds valid slots (prioritizing empty slots first, then least-crowded valid slots at 10k scale)."""
+    slot_counts_df = pd.read_sql_query(
+        "SELECT row_num, floor_num, COUNT(*) AS cnt, COALESCE(SUM(box_qty), 0) AS boxes FROM bin_map GROUP BY row_num, floor_num",
+        conn
+    )
+    occupancy_map = {
+        (int(r["row_num"]), int(r["floor_num"])): (int(r["cnt"]), int(r["boxes"]))
+        for _, r in slot_counts_df.iterrows()
+    }
 
-    valid_empty_slots = []
+    valid_slots = []
     for r in range(1, 9):
         for f in range(1, 7):
-            if (r, f) not in occupied_set:
-                ok, _ = validate_placement_against_rules(sku, name, cat, r, f, speed, notes)
-                if ok:
-                    valid_empty_slots.append((r, f, f"R{r:02d}-L{f}"))
+            ok, _ = validate_placement_against_rules(sku, name, cat, r, f, speed, notes)
+            if ok:
+                sku_cnt, box_cnt = occupancy_map.get((r, f), (0, 0))
+                valid_slots.append((sku_cnt, box_cnt, r, f, f"R{r:02d}-L{f}"))
 
-    if not valid_empty_slots:
-        return None, None, "Semua slot yang sesuai dengan zonasi barang ini sudah penuh!"
+    if not valid_slots:
+        return None, None, "Tidak ada slot yang memenuhi aturan zonasi & memori barang ini!"
 
-    candidate_codes = [s[2] for s in valid_empty_slots]
+    valid_slots.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+    top_candidates = valid_slots[:12]
+    candidate_labels = [
+        f"{s[4]} ({s[0]} SKU, {s[1]} dus)" for s in top_candidates
+    ]
+    candidate_codes = [s[4] for s in top_candidates]
+
     memory_block = get_memory_context()
     qty_desc = format_qty_summary(box_qty, pcs_per_box)
 
@@ -207,9 +337,9 @@ def auto_assign_bin(
         client, active_model, status = get_ai_client_and_model()
         if not status.startswith("Offline"):
             prompt = (
-                f"Pilih TEPAT SATU kode rak terbaik untuk produk baru berikut dari daftar slot kosong yang tersedia.\n"
+                f"Pilih TEPAT SATU kode rak terbaik untuk produk baru berikut dari daftar kandidat slot paling longgar.\n"
                 f"Produk: {sku} - {name} (Kategori: {cat}, Jumlah: {qty_desc}, Perputaran: {speed}, Catatan: {notes})\n"
-                f"Slot kosong valid: {', '.join(candidate_codes)}\n"
+                f"Kandidat slot valid: {', '.join(candidate_labels)}\n"
                 f"{memory_block}\n\n"
                 f"Balas HANYA dengan kode rak (contoh: R01-L1) diikuti 1 kalimat alasan singkat."
             )
@@ -228,13 +358,22 @@ def auto_assign_bin(
     except Exception:
         pass
 
-    best_r, best_f, best_code = valid_empty_slots[0]
-    return best_r, best_f, f"Dipilih otomatis sesuai aturan zonasi 85% ({best_code})."
+    _, _, best_r, best_f, best_code = top_candidates[0]
+    return best_r, best_f, f"Dipilih otomatis ke slot paling longgar sesuai zonasi 85% ({best_code})."
 
 # --- 3. PAGE HEADER & TABS (6 STREAMLINED TABS) ---
 st.set_page_config(page_title="Sistem Rak Gudang 8x6 - Jurnal AI", layout="wide")
 st.title("📦 Sistem Lokasi Rak Gudang (8 Baris × 6 Lantai)")
-st.caption("Zonasi 85% Ketat • 15% Fleksibel • Auto-Assign AI • Picking & Printable Invoice")
+
+stats_now = get_warehouse_stats()
+st.caption(
+    f"Zonasi 85% Ketat • 15% Fleksibel (PIN Supervisor) • Skala 10.000+ SKU Ready | "
+    f"📊 Total Stok: **{stats_now['total_skus']:,} SKU** • **{stats_now['total_boxes']:,} Dus** • "
+    f"**{stats_now['occupied_bins']}/48 Slot Terisi**"
+)
+
+if "tab6_unlocked" not in st.session_state:
+    st.session_state.tab6_unlocked = False
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1. Input Lokasi Rak SKU",
@@ -242,13 +381,13 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "3. Asisten & Prediksi AI",
     "4. Ambil Barang & Invoice",
     "5. Import Excel / CSV",
-    "6. Memori & Aturan AI"
+    "6. 🔒 Memori & Aturan AI"
 ])
 
 # --- TAB 1: INPUT & PEMETAAN RAK ---
 with tab1:
     st.subheader("Hubungkan Kode Produk Mekari Jurnal ke Rak (Baris 1–8, Lantai 1–6)")
-    st.info("🔒 **Sistem 85% Ketat (Zonasi Aktif):** Pelanggaran zonasi diblokir otomatis. Centang **Auto-Assign AI** jika ingin AI memilihkan rak kosong terbaik secara otomatis.")
+    st.info("🔒 **Sistem 85% Ketat (Zonasi Aktif):** Pelanggaran zonasi diblokir otomatis. Centang **Auto-Assign AI** agar AI memilihkan slot paling longgar sesuai zonasi.")
     
     with st.form("add_sku_form", clear_on_submit=True):
         col1, col2, col3 = st.columns(3)
@@ -273,7 +412,7 @@ with tab1:
         ])
 
         auto_mode = st.checkbox(
-            "🤖 Auto-Assign Lokasi Rak oleh AI (Otomatis pilih Baris & Lantai kosong sesuai zonasi & memori)",
+            "🤖 Auto-Assign Lokasi Rak oleh AI (Otomatis pilih Baris & Lantai paling longgar sesuai zonasi & memori)",
             value=True
         )
 
@@ -287,10 +426,19 @@ with tab1:
         notes = col6.text_input("Catatan Fisik", placeholder="Contoh: Dus besar, butuh tangga jika lantai 5-6")
 
         st.divider()
-        flex_expander = st.expander("🔓 15% Fleksibel: Opsi Pengecualian / Override Supervisor (Khusus Input Manual)")
+        flex_expander = st.expander("🔐 15% Fleksibel: Opsi Pengecualian / Override Supervisor (Wajib Passcode)")
         with flex_expander:
             allow_override = st.checkbox("Izinkan Penempatan di Luar Aturan Zonasi (Pengecualian)")
-            override_reason = st.text_input("Alasan Pengecualian (Wajib diisi jika dicentang):", placeholder="Contoh: Rak bawah penuh, titip sementara 1 hari")
+            ov_col1, ov_col2 = st.columns([2, 1])
+            override_reason = ov_col1.text_input(
+                "Alasan Pengecualian (Wajib diisi jika dicentang):",
+                placeholder="Contoh: Rak bawah penuh, titip sementara 1 hari"
+            )
+            override_pin_input = ov_col2.text_input(
+                "Passcode Supervisor:",
+                type="password",
+                placeholder="Masukkan PIN"
+            )
 
         if st.form_submit_button("Simpan Lokasi Rak"):
             if not sku.strip():
@@ -327,14 +475,18 @@ with tab1:
                         log_activity("DITOLAK_ZONASI", f"{sku.strip()} ({name.strip()}) ke {bin_code}: {block_reason}")
                         st.error(
                             f"⛔ **Penempatan Ditolak (85% Aturan Ketat):** {block_reason}\n\n"
-                            "💡 *Tip:* Centang **Auto-Assign Lokasi Rak oleh AI** di atas, atau buka **15% Fleksibel** jika ini kasus darurat."
+                            "💡 *Tip:* Centang **Auto-Assign Lokasi Rak oleh AI** di atas, atau buka **15% Fleksibel** dan masukkan Passcode Supervisor."
                         )
                     else:
                         if not is_allowed and allow_override:
                             if not override_reason.strip():
                                 st.warning("⚠️ Anda mencentang override, tetapi **Alasan Pengecualian** belum diisi!")
                                 st.stop()
-                            log_activity("OVERRIDE_ZONASI", f"OVERRIDE disetujui untuk {sku.strip()} ke {bin_code}. Alasan: {override_reason}")
+                            if override_pin_input.strip() != SUPERVISOR_PIN:
+                                log_activity("GAGAL_PIN_OVERRIDE", f"Percobaan override ditolak (PIN salah) untuk {sku.strip()} ke {bin_code}")
+                                st.error("🔐 **Passcode Supervisor Salah!** Pengecualian 15% dibatalkan.")
+                                st.stop()
+                            log_activity("OVERRIDE_ZONASI", f"OVERRIDE disetujui (PIN valid) untuk {sku.strip()} ke {bin_code}. Alasan: {override_reason}")
                             st.warning(f"⚠️ **Pengecualian 15% Diterapkan (Override):** Menyimpan ke {bin_code} meskipun melanggar zonasi. Alasan tercatat: *{override_reason}*")
 
                         conn.execute(
@@ -348,19 +500,33 @@ with tab1:
                             log_activity("SIMPAN_RAK", f"{sku.strip()} ({name.strip()}, {qty_label}) -> {bin_code}")
                         st.success(f"Berhasil menyimpan: {sku.strip()} ({qty_label}) → **{bin_code}** (Baris {row_num}, Lantai {floor_num})")
 
-    raw_bins_df = pd.read_sql_query("""
-        SELECT 
-            bin_location,
-            jurnal_sku,
-            product_name,
-            category,
-            box_qty,
-            pcs_per_box,
-            turnover_speed,
-            notes
-        FROM bin_map 
-        ORDER BY row_num, floor_num
-    """, conn)
+    st.divider()
+    search_col1, search_col2 = st.columns([3, 1])
+    sku_search_query = search_col1.text_input(
+        "🔍 Cari di Database Rak (SKU, Nama Produk, Kategori, atau Kode Rak):",
+        placeholder="Ketik kata kunci untuk menyaring dari ribuan SKU... (kosongkan untuk tampilkan 100 terbaru)"
+    )
+    row_limit = search_col2.selectbox("Batas Tampilan", [100, 250, 500], index=0)
+
+    if sku_search_query.strip():
+        pat = f"%{sku_search_query.strip().lower()}%"
+        raw_bins_df = pd.read_sql_query(
+            f"""SELECT bin_location, jurnal_sku, product_name, category, box_qty, pcs_per_box, turnover_speed, notes
+                FROM bin_map
+                WHERE LOWER(jurnal_sku) LIKE ? OR LOWER(product_name) LIKE ? OR LOWER(category) LIKE ? OR LOWER(bin_location) LIKE ?
+                ORDER BY row_num, floor_num
+                LIMIT {row_limit}""",
+            conn,
+            params=[pat, pat, pat, pat]
+        )
+    else:
+        raw_bins_df = pd.read_sql_query(
+            f"""SELECT bin_location, jurnal_sku, product_name, category, box_qty, pcs_per_box, turnover_speed, notes
+                FROM bin_map
+                ORDER BY rowid DESC
+                LIMIT {row_limit}""",
+            conn
+        )
 
     if raw_bins_df.empty:
         df_bins = pd.DataFrame(columns=[
@@ -386,12 +552,13 @@ with tab1:
             "Catatan": raw_bins_df["notes"]
         })
 
+    st.caption(f"Menampilkan **{len(df_bins)}** baris (dari total **{stats_now['total_skus']:,}** SKU di database).")
     st.dataframe(df_bins, width="stretch")
 
     if not df_bins.empty:
         del_col1, del_col2 = st.columns([2, 1])
         sku_to_delete = del_col1.selectbox(
-            "Hapus SKU dari Rak (jika salah input atau stok habis):",
+            "Hapus SKU dari Rak (dari hasil pencarian di atas):",
             df_bins["Kode SKU Jurnal"].tolist()
         )
         if del_col2.button("🗑️ Hapus SKU Terpilih"):
@@ -404,31 +571,58 @@ with tab1:
 # --- TAB 2: PETA VISUAL RAK 8 BARIS x 6 LANTAI ---
 with tab2:
     st.subheader("Denah Keterisian Rak (Lantai 6 Paling Atas → Lantai 1 Paling Bawah)")
-    raw_df = pd.read_sql_query("SELECT row_num, floor_num, jurnal_sku, product_name, box_qty FROM bin_map", conn)
+    agg_df = pd.read_sql_query(
+        """SELECT row_num, floor_num, COUNT(*) AS sku_cnt, COALESCE(SUM(box_qty), 0) AS total_dus
+           FROM bin_map
+           GROUP BY row_num, floor_num""",
+        conn
+    )
+    slot_lookup = {
+        (int(r["row_num"]), int(r["floor_num"])): (int(r["sku_cnt"]), int(r["total_dus"]))
+        for _, r in agg_df.iterrows()
+    }
     
     grid_data = {}
     for r in range(1, 9):
         col_label = f"Baris {r:02d}"
         grid_data[col_label] = []
         for f in range(6, 0, -1):
-            matches = raw_df[(raw_df["row_num"] == r) & (raw_df["floor_num"] == f)]
-            if matches.empty:
+            if (r, f) not in slot_lookup:
                 grid_data[col_label].append(f"[Kosong] R{r:02d}-L{f}")
             else:
-                items = ", ".join([
-                    f"{row['jurnal_sku']} ({int(row['box_qty'] or 1)} dus)"
-                    for _, row in matches.iterrows()
-                ])
-                grid_data[col_label].append(f"📦 {items}")
+                s_cnt, d_cnt = slot_lookup[(r, f)]
+                grid_data[col_label].append(f"📦 {s_cnt} SKU ({d_cnt} dus)")
 
     grid_df = pd.DataFrame(grid_data, index=[f"Lantai {f}" for f in range(6, 0, -1)])
     st.dataframe(grid_df, width="stretch", height=260)
+
+    st.divider()
+    st.markdown("#### 🔎 Inspeksi Isi Detail per Slot Rak")
+    insp_c1, insp_c2 = st.columns(2)
+    insp_row = insp_c1.selectbox("Pilih Baris", list(range(1, 9)), format_func=lambda x: f"Baris {x:02d}", key="insp_r")
+    insp_floor = insp_c2.selectbox("Pilih Lantai", list(range(1, 7)), format_func=lambda x: f"Lantai {x}", key="insp_f")
+    target_bin = f"R{insp_row:02d}-L{insp_floor}"
+
+    slot_items_df = pd.read_sql_query(
+        """SELECT jurnal_sku AS "SKU", product_name AS "Nama Produk", category AS "Kategori",
+                  box_qty AS "Jumlah Dus", pcs_per_box AS "Isi / Dus", turnover_speed AS "Perputaran", notes AS "Catatan"
+           FROM bin_map
+           WHERE row_num = ? AND floor_num = ?
+           ORDER BY jurnal_sku""",
+        conn,
+        params=[insp_row, insp_floor]
+    )
+    if slot_items_df.empty:
+        st.info(f"Slot **{target_bin}** saat ini kosong.")
+    else:
+        st.write(f"Isi Slot **{target_bin}** (**{len(slot_items_df)}** SKU):")
+        st.dataframe(slot_items_df, width="stretch")
 
 # --- TAB 3: GABUNGAN TANYA AI, MEMORI & PREDIKSI RAK BARANG MASUK ---
 with tab3:
     st.subheader("🤖 Asisten Gudang & Prediksi Penempatan Rak (Local AI)")
     _, active_model_preview, ai_status = get_ai_client_and_model()
-    st.caption(f"Status Koneksi AI: **{ai_status}** • Model: `{active_model_preview}`")
+    st.caption(f"Status Koneksi AI: **{ai_status}** • Model: `{active_model_preview}` • Mode Hemat Konteks (10k SKU Ready)")
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -451,7 +645,7 @@ with tab3:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    chat_input_val = st.chat_input("Tanya lokasi barang, jumlah dus/pcs, minta rekomendasi rak, atau ketik 'Ingat: ...'")
+    chat_input_val = st.chat_input("Tanya lokasi barang, jumlah dus/pcs, atau minta rekomendasi rak...")
 
     active_prompt = None
     if predict_clicked:
@@ -469,20 +663,26 @@ with tab3:
 
         lower_prompt = active_prompt.lower()
         if lower_prompt.startswith(("ingat:", "ingat bahwa", "catat:")):
-            clean_note = active_prompt.split(":", 1)[-1].strip() if ":" in active_prompt else active_prompt
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-            conn.execute(
-                "INSERT INTO warehouse_memory (category, memory_text, created_at) VALUES (?, ?, ?)",
-                ("Aturan Zona Rak", clean_note, now_str)
-            )
-            conn.commit()
-            log_activity("TAMBAH_MEMORI", clean_note)
-            reply = f"✅ Tersimpan ke memori permanen gudang: **\"{clean_note}\"**"
-            st.session_state.chat_history.append({"role": "assistant", "content": reply})
-            with st.chat_message("assistant"):
-                st.markdown(reply)
+            if not st.session_state.tab6_unlocked:
+                reply = "🔐 Penambahan aturan permanen (`Ingat: ...`) dilindungi Passcode Supervisor. Buka kunci **Tab 6 (Memori & Aturan AI)** terlebih dahulu untuk menambah aturan baru."
+                st.session_state.chat_history.append({"role": "assistant", "content": reply})
+                with st.chat_message("assistant"):
+                    st.warning(reply)
+            else:
+                clean_note = active_prompt.split(":", 1)[-1].strip() if ":" in active_prompt else active_prompt
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                conn.execute(
+                    "INSERT INTO warehouse_memory (category, memory_text, created_at) VALUES (?, ?, ?)",
+                    ("Aturan Zona Rak", clean_note, now_str)
+                )
+                conn.commit()
+                log_activity("TAMBAH_MEMORI", clean_note)
+                reply = f"✅ Tersimpan ke memori permanen gudang: **\"{clean_note}\"**"
+                st.session_state.chat_history.append({"role": "assistant", "content": reply})
+                with st.chat_message("assistant"):
+                    st.markdown(reply)
         else:
-            inventory_table = df_bins.to_csv(index=False) if not df_bins.empty else "Semua 48 slot rak masih kosong."
+            relevant_inventory = search_inventory_for_ai(active_prompt, limit=25)
             memory_block = get_memory_context()
 
             system_msg = f"""Kamu adalah asisten kepala gudang sekaligus perencana penempatan rak (8 Baris R01-R08, 6 Lantai L1-L6).
@@ -492,18 +692,17 @@ Zonasi wajib:
 - Slow-Moving / Bulky / Berat: Lantai 5-6 (L5-L6)
 
 Tugasmu:
-1. Jika pengguna menanyakan lokasi barang, stok (jumlah dus/pcs), atau riwayat gudang, jawab singkat dan akurat berdasarkan DATA RAK dan RIWAYAT AKTIVITAS.
-2. Jika pengguna meminta rekomendasi/prediksi rak untuk barang baru masuk, patuhi aturan zonasi dan ATURAN GUDANG di bawah, pilih 1 Kode Rak kosong terbaik (format R0X-LX), dan berikan 2 alasan singkat dalam Bahasa Indonesia.
+1. Jika pengguna menanyakan lokasi barang, stok (jumlah dus/pcs), atau riwayat gudang, jawab singkat dan akurat berdasarkan RINGKASAN & SAMPEL DATA SKU RELEVAN.
+2. Jika pengguna meminta rekomendasi/prediksi rak untuk barang baru masuk, patuhi aturan zonasi dan ATURAN GUDANG di bawah, pilih 1 Kode Rak terbaik (format R0X-LX) yang paling kosong/longgar, dan berikan 2 alasan singkat dalam Bahasa Indonesia.
 
 {memory_block}
 
-DATA RAK SAAT INI:
-{inventory_table}"""
+{relevant_inventory}"""
 
             recent_messages = [{"role": "system", "content": system_msg}] + st.session_state.chat_history[-6:]
 
             with st.chat_message("assistant"):
-                with st.spinner("Memproses permintaan dengan Local AI..."):
+                with st.spinner("Mencari di database & memproses dengan Local AI..."):
                     try:
                         client, active_model, _ = get_ai_client_and_model()
                         res = client.chat.completions.create(
@@ -518,18 +717,13 @@ DATA RAK SAAT INI:
                     except Exception as e:
                         st.error(
                             f"Gagal terhubung ke Local AI Server: {e}\n\n"
-                            "Pastikan di **LM Studio** / **Jan AI**, model Qwen2.5-3B-Instruct sudah dalam status **Started / Active**."
+                            "Pastikan di **LM Studio** / **Jan AI**, model Qwen2.5 sudah dalam status **Started / Active**."
                         )
 
 # --- TAB 4: AMBIL BARANG DARI RAK & PRINTABLE INVOICE ---
 with tab4:
     st.subheader("🛒 Pengambilan Barang (Picking) & Cetak Invoice / Surat Jalan")
-    pick_df = pd.read_sql_query(
-        "SELECT jurnal_sku, product_name, category, row_num, floor_num, bin_location, notes, box_qty, pcs_per_box FROM bin_map ORDER BY row_num, floor_num",
-        conn
-    )
-
-    if pick_df.empty:
+    if stats_now["total_skus"] == 0:
         st.info("Belum ada barang tersimpan di rak untuk diambil. Tambahkan barang terlebih dahulu di Tab 1.")
     else:
         inv_col1, inv_col2, inv_col3 = st.columns(3)
@@ -537,6 +731,31 @@ with tab4:
         invoice_no = inv_col1.text_input("Nomor Invoice / Surat Jalan", value=default_inv_no)
         customer_name = inv_col2.text_input("Nama Pelanggan / Tujuan Pengiriman", placeholder="Contoh: Toko Sport Jaya / Cabang Surabaya")
         picker_name = inv_col3.text_input("Nama Staf Pengambil / Picker", placeholder="Contoh: Budi")
+
+        pick_search = st.text_input(
+            "🔍 Filter / Cari Barang yang Akan Diambil (ketik SKU, Nama Produk, atau Kode Rak):",
+            placeholder="Contoh: JRN-1042 atau Yonex atau R01 (menampilkan maks 50 hasil agar cepat di HP)"
+        )
+
+        if pick_search.strip():
+            p_pat = f"%{pick_search.strip().lower()}%"
+            pick_df = pd.read_sql_query(
+                """SELECT jurnal_sku, product_name, category, row_num, floor_num, bin_location, notes, box_qty, pcs_per_box
+                   FROM bin_map
+                   WHERE LOWER(jurnal_sku) LIKE ? OR LOWER(product_name) LIKE ? OR LOWER(bin_location) LIKE ?
+                   ORDER BY row_num, floor_num
+                   LIMIT 50""",
+                conn,
+                params=[p_pat, p_pat, p_pat]
+            )
+        else:
+            pick_df = pd.read_sql_query(
+                """SELECT jurnal_sku, product_name, category, row_num, floor_num, bin_location, notes, box_qty, pcs_per_box
+                   FROM bin_map
+                   ORDER BY row_num, floor_num
+                   LIMIT 50""",
+                conn
+            )
 
         pick_df["label"] = pick_df.apply(
             lambda r: f"[{r['bin_location']}] {r['jurnal_sku']} — {r['product_name']} ({format_qty_summary(r['box_qty'], r['pcs_per_box'])})",
@@ -824,7 +1043,7 @@ with tab4:
 
 # --- TAB 5: IMPORT DATA LAMA (EXCEL / CSV) ---
 with tab5:
-    st.subheader("Import Data Massal dari WMS Lama / Excel / Mekari Jurnal")
+    st.subheader("Import Data Massal dari WMS Lama / Excel / Mekari Jurnal (Batch 10.000+ SKU)")
     st.markdown(
         "Unggah file **.xlsx** atau **.csv** dengan kolom wajib: "
         "`jurnal_sku`, `product_name`, `row_num` (1–8), dan `floor_num` (1–6). "
@@ -860,7 +1079,7 @@ with tab5:
             else:
                 upload_df = pd.read_excel(uploaded_file)
 
-            st.write("Pratinjau Data yang Akan Diimpor:")
+            st.write(f"Pratinjau Data (**{len(upload_df):,}** baris terdeteksi):")
             st.dataframe(upload_df.head(10), width="stretch")
 
             if st.button("Proses Import ke Database"):
@@ -868,7 +1087,7 @@ with tab5:
                 if not required_cols.issubset(set(upload_df.columns)):
                     st.error(f"Kolom wajib tidak lengkap. Pastikan ada: {', '.join(required_cols)}")
                 else:
-                    imported_count = 0
+                    records_to_insert = []
                     skipped_count = 0
                     for _, row in upload_df.iterrows():
                         sku_val = str(row["jurnal_sku"]).strip()
@@ -897,71 +1116,97 @@ with tab5:
                         pcs_val = int(row["pcs_per_box"]) if pd.notna(row.get("pcs_per_box")) and int(row["pcs_per_box"]) > 0 else None
                         bin_code = f"R{r_val:02d}-L{f_val}"
 
-                        conn.execute(
+                        records_to_insert.append(
+                            (sku_val, name_val, cat_val, r_val, f_val, bin_code, speed_val, notes_val, box_val, pcs_val)
+                        )
+
+                    if records_to_insert:
+                        conn.executemany(
                             """INSERT OR REPLACE INTO bin_map
                                (jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box)
                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (sku_val, name_val, cat_val, r_val, f_val, bin_code, speed_val, notes_val, box_val, pcs_val)
+                            records_to_insert
                         )
-                        imported_count += 1
+                        conn.commit()
 
-                    conn.commit()
+                    imported_count = len(records_to_insert)
                     log_activity("IMPORT_MASSAL", f"Import {imported_count} SKU dari {uploaded_file.name}")
                     st.success(
-                        f"Selesai! **{imported_count}** SKU berhasil diimpor ke database "
+                        f"Selesai! **{imported_count:,}** SKU berhasil diimpor dalam 1 batch cepat "
                         f"({skipped_count} baris dilewati)."
                     )
         except Exception as e:
             st.error(f"Gagal membaca file: {e}")
 
-# --- TAB 6: MEMORI & ATURAN AI ---
+# --- TAB 6: MEMORI & ATURAN AI (PASSCODE PROTECTED) ---
 with tab6:
     st.subheader("🧠 Memori Permanen & Aturan Khusus Gudang")
-    st.caption("Semua catatan di sini disimpan di SQLite dan otomatis diperiksa saat input barang maupun tanya AI.")
 
-    with st.form("add_memory_form", clear_on_submit=True):
-        m_col1, m_col2 = st.columns([1, 3])
-        mem_cat = m_col1.selectbox("Jenis Memori", [
-            "Aturan Zona Rak",
-            "Kondisi Fisik Rak",
-            "Info Supplier / Barang",
-            "SOP Staf Gudang"
-        ])
-        mem_text = m_col2.text_input(
-            "Isi Memori / Aturan yang Harus Diingat AI:",
-            placeholder="Contoh: Baris 01 hanya boleh diisi oleh raket badminton"
-        )
-        if st.form_submit_button("Simpan ke Memori AI"):
-            if mem_text.strip():
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                conn.execute(
-                    "INSERT INTO warehouse_memory (category, memory_text, created_at) VALUES (?, ?, ?)",
-                    (mem_cat, mem_text.strip(), now_str)
-                )
-                conn.commit()
-                log_activity("TAMBAH_MEMORI", f"[{mem_cat}] {mem_text.strip()}")
-                st.success("Memori berhasil disimpan! Aturan zonasi 85% dan fleksibilitas 15% aktif.")
+    if not st.session_state.tab6_unlocked:
+        st.warning("🔐 **Akses Terkunci (Supervisor Only):** Masukkan Passcode Supervisor untuk melihat atau mengubah aturan permanen & riwayat log gudang.")
+        with st.form("unlock_tab6_form"):
+            pin_col1, pin_col2 = st.columns([2, 1])
+            tab6_pin = pin_col1.text_input("Passcode Supervisor:", type="password", placeholder="Masukkan PIN Supervisor")
+            unlock_submitted = pin_col2.form_submit_button("🔓 Buka Kunci Tab 6", width="stretch")
+
+        if unlock_submitted:
+            if tab6_pin.strip() == SUPERVISOR_PIN:
+                st.session_state.tab6_unlocked = True
+                log_activity("BUKA_TAB6", "Supervisor membuka akses Tab 6 Memori & Aturan")
+                st.rerun()
             else:
-                st.warning("Isi teks memori terlebih dahulu.")
-
-    mem_table = pd.read_sql_query(
-        "SELECT id AS 'ID', created_at AS 'Waktu', category AS 'Kategori', memory_text AS 'Isi Memori' FROM warehouse_memory ORDER BY id DESC",
-        conn
-    )
-    st.dataframe(mem_table, width="stretch")
-
-    if not mem_table.empty:
-        del_id = st.number_input("Hapus Memori berdasarkan ID:", min_value=1, step=1)
-        if st.button("Hapus Memori Ini"):
-            conn.execute("DELETE FROM warehouse_memory WHERE id = ?", (int(del_id),))
-            conn.commit()
-            st.success(f"Memori ID #{int(del_id)} dihapus.")
+                log_activity("GAGAL_PIN_TAB6", "Percobaan membuka Tab 6 gagal (PIN salah)")
+                st.error("⛔ Passcode salah! Akses ditolak.")
+    else:
+        top_c1, top_c2 = st.columns([3, 1])
+        top_c1.caption("🔓 Terbuka untuk Supervisor • Semua catatan di sini otomatis diperiksa saat input barang maupun tanya AI.")
+        if top_c2.button("🔒 Kunci Kembali Tab 6", width="stretch"):
+            st.session_state.tab6_unlocked = False
             st.rerun()
 
-    st.divider()
-    st.subheader("📜 Riwayat Aktivitas Gudang (Otomatis Diingat AI)")
-    log_table = pd.read_sql_query(
-        "SELECT timestamp AS 'Waktu', action AS 'Aksi', details AS 'Detail' FROM activity_log ORDER BY id DESC LIMIT 30",
-        conn
-    )
-    st.dataframe(log_table, width="stretch")
+        with st.form("add_memory_form", clear_on_submit=True):
+            m_col1, m_col2 = st.columns([1, 3])
+            mem_cat = m_col1.selectbox("Jenis Memori", [
+                "Aturan Zona Rak",
+                "Kondisi Fisik Rak",
+                "Info Supplier / Barang",
+                "SOP Staf Gudang"
+            ])
+            mem_text = m_col2.text_input(
+                "Isi Memori / Aturan yang Harus Diingat AI:",
+                placeholder="Contoh: Baris 01 hanya boleh diisi oleh raket badminton"
+            )
+            if st.form_submit_button("Simpan ke Memori AI"):
+                if mem_text.strip():
+                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    conn.execute(
+                        "INSERT INTO warehouse_memory (category, memory_text, created_at) VALUES (?, ?, ?)",
+                        (mem_cat, mem_text.strip(), now_str)
+                    )
+                    conn.commit()
+                    log_activity("TAMBAH_MEMORI", f"[{mem_cat}] {mem_text.strip()}")
+                    st.success("Memori berhasil disimpan! Aturan zonasi 85% dan fleksibilitas 15% aktif.")
+                else:
+                    st.warning("Isi teks memori terlebih dahulu.")
+
+        mem_table = pd.read_sql_query(
+            "SELECT id AS 'ID', created_at AS 'Waktu', category AS 'Kategori', memory_text AS 'Isi Memori' FROM warehouse_memory ORDER BY id DESC",
+            conn
+        )
+        st.dataframe(mem_table, width="stretch")
+
+        if not mem_table.empty:
+            del_id = st.number_input("Hapus Memori berdasarkan ID:", min_value=1, step=1)
+            if st.button("Hapus Memori Ini"):
+                conn.execute("DELETE FROM warehouse_memory WHERE id = ?", (int(del_id),))
+                conn.commit()
+                st.success(f"Memori ID #{int(del_id)} dihapus.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("📜 Riwayat Aktivitas Gudang (Otomatis Diingat AI)")
+        log_table = pd.read_sql_query(
+            "SELECT timestamp AS 'Waktu', action AS 'Aksi', details AS 'Detail' FROM activity_log ORDER BY id DESC LIMIT 30",
+            conn
+        )
+        st.dataframe(log_table, width="stretch")
