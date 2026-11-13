@@ -2,6 +2,7 @@ import sqlite3
 from datetime import datetime
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from openai import OpenAI
 
 # --- 1. LOCAL AI CONNECTION SETUP (LM Studio Port 1234 -> Jan AI Port 1337 Fallback) ---
@@ -108,7 +109,6 @@ def validate_placement_against_rules(
         return True, ""
 
     item_blob = f"{sku} {name} {cat} {notes}".lower()
-    bin_code = f"R{row_num:02d}-L{floor_num}"
 
     for _, r in mem_df.iterrows():
         rule_raw = str(r["memory_text"]).strip()
@@ -138,15 +138,16 @@ def validate_placement_against_rules(
 # --- 3. PAGE HEADER & TABS ---
 st.set_page_config(page_title="Sistem Rak Gudang 8x6 - Jurnal AI", layout="wide")
 st.title("📦 Sistem Lokasi Rak Gudang (8 Baris × 6 Lantai)")
-st.caption("Zonasi 85% Ketat • 15% Fleksibel dengan Supervisor Override")
+st.caption("Zonasi 85% Ketat • 15% Fleksibel • Picking & Printable Invoice")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "1. Input Lokasi Rak SKU",
     "2. Peta Visual Rak (8×6)",
     "3. Tanya AI (Dengan Memori)",
     "4. Prediksi Rak Barang Masuk",
-    "5. Import Excel / CSV",
-    "6. Memori & Aturan AI"
+    "5. Ambil Barang & Invoice",
+    "6. Import Excel / CSV",
+    "7. Memori & Aturan AI"
 ])
 
 # --- TAB 1: INPUT & PEMETAAN RAK ---
@@ -373,8 +374,288 @@ Rak terisi saat ini:
                 except Exception as e:
                     st.error(f"Gagal terhubung ke Local AI Server: {e}")
 
-# --- TAB 5: IMPORT DATA LAMA (EXCEL / CSV) ---
+# --- TAB 5: AMBIL BARANG DARI RAK & PRINTABLE INVOICE ---
 with tab5:
+    st.subheader("🛒 Pengambilan Barang (Picking) & Cetak Invoice / Surat Jalan")
+    pick_df = pd.read_sql_query(
+        "SELECT jurnal_sku, product_name, category, row_num, floor_num, bin_location, notes FROM bin_map ORDER BY row_num, floor_num",
+        conn
+    )
+
+    if pick_df.empty:
+        st.info("Belum ada barang tersimpan di rak untuk diambil. Tambahkan barang terlebih dahulu di Tab 1.")
+    else:
+        inv_col1, inv_col2, inv_col3 = st.columns(3)
+        default_inv_no = f"INV-{datetime.now().strftime('%Y%m%d-%H%M')}"
+        invoice_no = inv_col1.text_input("Nomor Invoice / Surat Jalan", value=default_inv_no)
+        customer_name = inv_col2.text_input("Nama Pelanggan / Tujuan Pengiriman", placeholder="Contoh: Toko Sport Jaya / Cabang Surabaya")
+        picker_name = inv_col3.text_input("Nama Staf Pengambil / Picker", placeholder="Contoh: Budi")
+
+        pick_df["label"] = pick_df.apply(
+            lambda r: f"[{r['bin_location']}] {r['jurnal_sku']} — {r['product_name']}", axis=1
+        )
+        selected_labels = st.multiselect(
+            "Pilih Barang yang Akan Diambil dari Rak (Otomatis diurutkan sesuai jalur rak R01 → R08):",
+            options=pick_df["label"].tolist()
+        )
+
+        if selected_labels:
+            selected_rows = pick_df[pick_df["label"].isin(selected_labels)].sort_values(by=["row_num", "floor_num"])
+            st.markdown("#### Detail Jumlah & Harga per Item")
+
+            picked_items = []
+            for idx, r in selected_rows.iterrows():
+                c1, c2, c3, c4 = st.columns([2.5, 1, 1.5, 2])
+                c1.markdown(f"**{r['bin_location']}** | `{r['jurnal_sku']}`<br>{r['product_name']}", unsafe_allow_html=True)
+                qty = c2.number_input("Qty", min_value=1, value=1, step=1, key=f"qty_{r['jurnal_sku']}")
+                price = c3.number_input("Harga Satuan (Rp)", min_value=0, value=0, step=1000, key=f"price_{r['jurnal_sku']}")
+                item_note = c4.text_input("Keterangan", value=r["notes"] if r["notes"] else "", key=f"note_{r['jurnal_sku']}")
+
+                picked_items.append({
+                    "Kode Rak": r["bin_location"],
+                    "Kode SKU": r["jurnal_sku"],
+                    "Nama Produk": r["product_name"],
+                    "Qty": qty,
+                    "Harga Satuan": price,
+                    "Subtotal": qty * price,
+                    "Keterangan": item_note
+                })
+
+            st.divider()
+            opt_col1, opt_col2 = st.columns([2, 1])
+            clear_from_rack = opt_col1.checkbox(
+                "Kosongkan slot rak otomatis setelah invoice dibuat (jika stok barang tersebut habis diambil)",
+                value=False
+            )
+
+            if opt_col2.button("🧾 Buat & Tampilkan Invoice Siap Cetak", type="primary"):
+                inv_items_df = pd.DataFrame(picked_items)
+                grand_total = inv_items_df["Subtotal"].sum()
+                now_display = datetime.now().strftime("%d %B %Y, %H:%M WIB")
+
+                # Log picking activity
+                sku_summary = ", ".join([f"{x['Kode SKU']} ({x['Qty']}x dari {x['Kode Rak']})" for x in picked_items])
+                log_activity("AMBIL_BARANG", f"{invoice_no} untuk '{customer_name or 'Umum'}': {sku_summary}")
+
+                # Optionally remove picked SKUs from bin_map
+                if clear_from_rack:
+                    for x in picked_items:
+                        conn.execute("DELETE FROM bin_map WHERE jurnal_sku = ?", (x["Kode SKU"],))
+                    conn.commit()
+                    log_activity("KOSONGKAN_RAK", f"Slot dikosongkan otomatis setelah picking {invoice_no}")
+
+                # Build HTML rows
+                rows_html = ""
+                for i, item in enumerate(picked_items, start=1):
+                    harga_str = f"Rp {item['Harga Satuan']:,.0f}".replace(",", ".") if item["Harga Satuan"] > 0 else "-"
+                    sub_str = f"Rp {item['Subtotal']:,.0f}".replace(",", ".") if item["Subtotal"] > 0 else "-"
+                    rows_html += f"""
+                    <tr>
+                        <td style="text-align:center;">{i}</td>
+                        <td style="font-weight:bold; color:#0f172a;">{item['Kode Rak']}</td>
+                        <td>{item['Kode SKU']}</td>
+                        <td>{item['Nama Produk']}</td>
+                        <td style="text-align:center; font-weight:bold;">{item['Qty']}</td>
+                        <td style="text-align:right;">{harga_str}</td>
+                        <td style="text-align:right;">{sub_str}</td>
+                        <td>{item['Keterangan']}</td>
+                    </tr>
+                    """
+
+                total_str = f"Rp {grand_total:,.0f}".replace(",", ".") if grand_total > 0 else "-"
+
+                printable_html = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                <meta charset="utf-8">
+                <style>
+                    body {{
+                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                        color: #1e293b;
+                        background: #ffffff;
+                        padding: 24px;
+                        margin: 0;
+                    }}
+                    .invoice-box {{
+                        max-width: 820px;
+                        margin: auto;
+                        border: 1px solid #cbd5e1;
+                        border-radius: 8px;
+                        padding: 28px;
+                        background: #fff;
+                    }}
+                    .header {{
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: flex-start;
+                        border-bottom: 2px solid #0f172a;
+                        padding-bottom: 14px;
+                        margin-bottom: 18px;
+                    }}
+                    .title {{
+                        font-size: 22px;
+                        font-weight: 700;
+                        color: #0f172a;
+                        margin: 0;
+                    }}
+                    .subtitle {{
+                        font-size: 13px;
+                        color: #64748b;
+                        margin-top: 4px;
+                    }}
+                    .meta {{
+                        text-align: right;
+                        font-size: 13px;
+                        line-height: 1.6;
+                    }}
+                    .info-grid {{
+                        display: flex;
+                        justify-content: space-between;
+                        margin-bottom: 20px;
+                        font-size: 14px;
+                        background: #f8fafc;
+                        padding: 12px 16px;
+                        border-radius: 6px;
+                    }}
+                    table {{
+                        width: 100%;
+                        border-collapse: collapse;
+                        font-size: 13px;
+                    }}
+                    th {{
+                        background: #0f172a;
+                        color: #ffffff;
+                        padding: 10px 8px;
+                        text-align: left;
+                    }}
+                    td {{
+                        border-bottom: 1px solid #e2e8f0;
+                        padding: 9px 8px;
+                    }}
+                    .total-row td {{
+                        font-weight: 700;
+                        font-size: 14px;
+                        border-top: 2px solid #0f172a;
+                        background: #f8fafc;
+                    }}
+                    .signatures {{
+                        display: flex;
+                        justify-content: space-between;
+                        margin-top: 42px;
+                        text-align: center;
+                        font-size: 13px;
+                    }}
+                    .sig-box {{
+                        width: 28%;
+                    }}
+                    .sig-line {{
+                        margin-top: 52px;
+                        border-top: 1px solid #475569;
+                        padding-top: 4px;
+                    }}
+                    .print-btn {{
+                        background: #2563eb;
+                        color: white;
+                        border: none;
+                        padding: 10px 20px;
+                        font-size: 14px;
+                        font-weight: 600;
+                        border-radius: 6px;
+                        cursor: pointer;
+                        margin-bottom: 16px;
+                    }}
+                    .print-btn:hover {{
+                        background: #1d4ed8;
+                    }}
+                    @media print {{
+                        .no-print {{ display: none !important; }}
+                        body {{ padding: 0; }}
+                        .invoice-box {{ border: none; padding: 0; }}
+                    }}
+                </style>
+                </head>
+                <body>
+                    <div class="no-print" style="text-align:right; max-width:820px; margin:auto;">
+                        <button class="print-btn" onclick="window.print()">🖨️ Cetak Invoice / Simpan PDF</button>
+                    </div>
+                    <div class="invoice-box">
+                        <div class="header">
+                            <div>
+                                <div class="title">INVOICE & SURAT JALAN PENGAMBILAN</div>
+                                <div class="subtitle">Sistem Manajemen Rak Gudang (8 Baris × 6 Lantai) • Mekari Jurnal</div>
+                            </div>
+                            <div class="meta">
+                                <strong>No. Dokumen:</strong> {invoice_no}<br>
+                                <strong>Tanggal:</strong> {now_display}
+                            </div>
+                        </div>
+                        <div class="info-grid">
+                            <div>
+                                <strong>Tujuan / Pelanggan:</strong><br>
+                                {customer_name if customer_name.strip() else "Pengambilan Internal / Umum"}
+                            </div>
+                            <div style="text-align:right;">
+                                <strong>Petugas Gudang (Picker):</strong><br>
+                                {picker_name if picker_name.strip() else "-"}
+                            </div>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th style="text-align:center; width:36px;">No</th>
+                                    <th>Lokasi Rak</th>
+                                    <th>Kode SKU</th>
+                                    <th>Nama Produk</th>
+                                    <th style="text-align:center;">Qty</th>
+                                    <th style="text-align:right;">Harga Satuan</th>
+                                    <th style="text-align:right;">Subtotal</th>
+                                    <th>Keterangan</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {rows_html}
+                                <tr class="total-row">
+                                    <td colspan="4" style="text-align:right;">TOTAL KESELURUHAN</td>
+                                    <td style="text-align:center;">{inv_items_df['Qty'].sum()}</td>
+                                    <td></td>
+                                    <td style="text-align:right;">{total_str}</td>
+                                    <td></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                        <div class="signatures">
+                            <div class="sig-box">
+                                Dibuat Oleh,
+                                <div class="sig-line">Admin Gudang</div>
+                            </div>
+                            <div class="sig-box">
+                                Diambil Oleh,
+                                <div class="sig-line">{picker_name if picker_name.strip() else "Staf Picker"}</div>
+                            </div>
+                            <div class="sig-box">
+                                Diterima Oleh,
+                                <div class="sig-line">Penerima / Kurir</div>
+                            </div>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """
+
+                st.success(f"Invoice **{invoice_no}** berhasil dibuat! Klik tombol **🖨️ Cetak Invoice / Simpan PDF** di bawah ini.")
+                components.html(printable_html, height=620, scrolling=True)
+
+                csv_invoice = inv_items_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="⬇️ Download Data Invoice (CSV)",
+                    data=csv_invoice,
+                    file_name=f"{invoice_no}.csv",
+                    mime="text/csv"
+                )
+
+# --- TAB 6: IMPORT DATA LAMA (EXCEL / CSV) ---
+with tab6:
     st.subheader("Import Data Massal dari WMS Lama / Excel / Mekari Jurnal")
     st.markdown(
         "Unggah file **.xlsx** atau **.csv** dengan kolom wajib: "
@@ -459,8 +740,8 @@ with tab5:
         except Exception as e:
             st.error(f"Gagal membaca file: {e}")
 
-# --- TAB 6: MEMORI & ATURAN AI ---
-with tab6:
+# --- TAB 7: MEMORI & ATURAN AI ---
+with tab7:
     st.subheader("🧠 Memori Permanen & Aturan Khusus Gudang")
     st.caption("Semua catatan di sini disimpan di SQLite dan otomatis diperiksa saat input barang maupun tanya AI.")
 
