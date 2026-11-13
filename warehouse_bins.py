@@ -731,4 +731,100 @@ with tab4:
                 for it in picked_items:
                     rem = it["avail"] - it["ambil"]
                     if rem <= 0:
-                        conn.execute("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (pick_wh
+                        conn.execute("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (pick_wh, it["sku"]))
+                    else:
+                        conn.execute("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (rem, pick_wh, it["sku"]))
+                conn.commit()
+                log_activity("PICKING", f"[{pick_wh}] Picking {inv_no} oleh {picker} untuk {len(picked_items)} SKU", actor=picker)
+                st.success(f"Surat Jalan **{inv_no}** ({pick_wh}) berhasil diterbitkan dan stok dipotong otomatis!")
+
+# --- TAB 5: REORDER ALERTS ---
+with tab5:
+    st.subheader("⚠️ Low Stock & Reorder Alerts")
+    low_stock_df = pd.read_sql_query(
+        "SELECT warehouse AS 'Gudang', bin_location AS 'Rak', jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus Tersisa', min_box_threshold AS 'Batas Minimum' FROM bin_map WHERE box_qty <= min_box_threshold ORDER BY warehouse, box_qty ASC",
+        conn
+    )
+    if low_stock_df.empty:
+        st.success("✨ Semua stok di Surabaya & Jakarta aman! Tidak ada SKU di bawah batas minimum.")
+    else:
+        st.warning(f"Ditemukan **{len(low_stock_df)} SKU** yang menipis dan perlu segera direorder:")
+        st.dataframe(low_stock_df, width="stretch")
+        csv_reorder = low_stock_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download Daftar Reorder (CSV)", data=csv_reorder, file_name="reorder_list_sby_jkt.csv", mime="text/csv")
+
+# --- TAB 6: FIFO & EXPIRY TRACKING ---
+with tab6:
+    st.subheader("⏳ FIFO & Expiry Date Management")
+    expiry_df = pd.read_sql_query(
+        "SELECT warehouse AS 'Gudang', bin_location AS 'Rak', jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus', expiry_date AS 'Expired Date' FROM bin_map WHERE expiry_date IS NOT NULL ORDER BY expiry_date ASC",
+        conn
+    )
+    if expiry_df.empty:
+        st.info("Belum ada data kadaluarsa (expiry date) yang dimasukkan.")
+    else:
+        st.markdown("Daftar produk diurutkan berdasarkan kedaluwarsa terdekat (**FIFO Priority**):")
+        st.dataframe(expiry_df, width="stretch")
+
+# --- TAB 7: IMPORT EXCEL / CSV ---
+with tab7:
+    st.subheader("Import Massal WMS")
+    default_import_wh = st.selectbox("Gudang Default (jika kolom 'warehouse' tidak ada di file)", WAREHOUSES)
+    up_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
+    if up_file:
+        df_up = pd.read_csv(up_file) if up_file.name.endswith(".csv") else pd.read_excel(up_file)
+        st.dataframe(df_up.head(5))
+        if st.button("Proses Import Batch"):
+            records = []
+            for _, row in df_up.iterrows():
+                wh_val = str(row.get("warehouse", default_import_wh)).strip().title()
+                if wh_val not in WAREHOUSES:
+                    wh_val = default_import_wh
+                records.append((
+                    wh_val,
+                    str(row["jurnal_sku"]),
+                    str(row["product_name"]),
+                    str(row.get("category", "")),
+                    int(row["row_num"]),
+                    int(row["floor_num"]),
+                    f"R{int(row['row_num']):02d}-L{int(row['floor_num'])}",
+                    str(row.get("turnover_speed", "Medium (Normal)")),
+                    str(row.get("notes", "")),
+                    int(row.get("box_qty", 1)),
+                    int(row.get("pcs_per_box", 0)) if pd.notna(row.get("pcs_per_box")) else None,
+                    3,
+                    None
+                ))
+            conn.executemany(
+                "INSERT OR REPLACE INTO bin_map (warehouse, jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold, expiry_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                records
+            )
+            conn.commit()
+            log_activity("IMPORT_MASSAL", f"Import {len(records)} SKU")
+            st.success(f"Berhasil mengimpor {len(records)} SKU!")
+
+# --- TAB 8: MEMORI & LEADERBOARD (PASSCODE PROTECTED) ---
+with tab8:
+    st.subheader("🧠 Memori Aturan & Staff Activity Leaderboard")
+    if not st.session_state.tab6_unlocked:
+        with st.form("unlock_t8"):
+            p_in = st.text_input("Passcode Supervisor:", type="password")
+            if st.form_submit_button("Buka Kunci"):
+                if p_in.strip() == SUPERVISOR_PIN:
+                    st.session_state.tab6_unlocked = True
+                    st.rerun()
+                else:
+                    st.error("PIN Salah!")
+    else:
+        if st.button("🔒 Kunci Kembali"):
+            st.session_state.tab6_unlocked = False
+            st.rerun()
+
+        st.markdown("#### 🏆 Leaderboard Aktivitas Staf Gudang")
+        leader_df = pd.read_sql_query("SELECT actor AS 'Staf / Aktor', COUNT(*) AS 'Total Aktivitas Terbuka' FROM activity_log GROUP BY actor ORDER BY COUNT(*) DESC", conn)
+        st.dataframe(leader_df, width="stretch")
+
+        st.divider()
+        st.markdown("#### 📜 Riwayat Aktivitas Lengkap")
+        log_df = pd.read_sql_query("SELECT timestamp AS 'Waktu', actor AS 'Aktor', action AS 'Aksi', details AS 'Detail' FROM activity_log ORDER BY id DESC LIMIT 50", conn)
+        st.dataframe(log_df, width="stretch")
