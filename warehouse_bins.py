@@ -16,7 +16,6 @@ def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
             models = client.models.list()
             if models.data:
                 all_ids = [m.id for m in models.data]
-                # 1. Prioritize Qwen / Instruct / Chat models explicitly and block embedding models
                 preferred = [
                     mid for mid in all_ids
                     if any(good in mid.lower() for good in ("qwen", "instruct", "chat", "gemma", "llama"))
@@ -25,7 +24,6 @@ def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
                 if preferred:
                     return client, preferred[0], f"Local AI ({server_name} :{port})"
 
-                # 2. Otherwise pick any non-embedding model
                 chat_models = [
                     mid for mid in all_ids
                     if not any(bad in mid.lower() for bad in ("embed", "bge", "e5-", "rerank", "sentence-transformer"))
@@ -51,7 +49,7 @@ def get_ai_client_and_model() -> tuple[OpenAI, str, str]:
 
     return OpenAI(base_url="http://127.0.0.1:1337/v1", api_key="not-needed"), "Qwen2.5-3B-Instruct-4bit", "Offline (Server Belum Aktif)"
 
-# --- 2. DATABASE SETUP (SQLite + Persistent AI Memory) ---
+# --- 2. DATABASE SETUP & MIGRATION (SQLite + Persistent AI Memory) ---
 conn = sqlite3.connect("jurnal_bins.db", check_same_thread=False)
 conn.execute("""
     CREATE TABLE IF NOT EXISTS bin_map (
@@ -62,9 +60,19 @@ conn.execute("""
         floor_num INTEGER,
         bin_location TEXT,
         turnover_speed TEXT,
-        notes TEXT
+        notes TEXT,
+        box_qty INTEGER DEFAULT 1,
+        pcs_per_box INTEGER
     )
 """)
+
+# Safe migration for existing databases created before box_qty / pcs_per_box were added
+existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(bin_map)").fetchall()]
+if "box_qty" not in existing_cols:
+    conn.execute("ALTER TABLE bin_map ADD COLUMN box_qty INTEGER DEFAULT 1")
+if "pcs_per_box" not in existing_cols:
+    conn.execute("ALTER TABLE bin_map ADD COLUMN pcs_per_box INTEGER")
+
 conn.execute("""
     CREATE TABLE IF NOT EXISTS warehouse_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +98,13 @@ def log_activity(action: str, details: str):
         (now, action, details)
     )
     conn.commit()
+
+def format_qty_summary(box_qty: int, pcs_per_box: int | None) -> str:
+    b_qty = int(box_qty) if pd.notna(box_qty) and box_qty else 1
+    if pd.notna(pcs_per_box) and pcs_per_box and int(pcs_per_box) > 0:
+        p_qty = int(pcs_per_box)
+        return f"{b_qty} dus × {p_qty} pcs ({b_qty * p_qty:,} pcs)".replace(",", ".")
+    return f"{b_qty} dus"
 
 def get_memory_context() -> str:
     """Fetches saved warehouse rules & recent logs to feed into the AI."""
@@ -166,7 +181,9 @@ def validate_placement_against_rules(
 
     return True, ""
 
-def auto_assign_bin(sku: str, name: str, cat: str, speed: str, notes: str) -> tuple[int | None, int | None, str]:
+def auto_assign_bin(
+    sku: str, name: str, cat: str, speed: str, notes: str, box_qty: int, pcs_per_box: int | None
+) -> tuple[int | None, int | None, str]:
     """Finds valid empty slots matching 85% rules and asks Local AI to pick the best one."""
     occupied_df = pd.read_sql_query("SELECT row_num, floor_num FROM bin_map", conn)
     occupied_set = set(zip(occupied_df["row_num"], occupied_df["floor_num"]))
@@ -184,13 +201,14 @@ def auto_assign_bin(sku: str, name: str, cat: str, speed: str, notes: str) -> tu
 
     candidate_codes = [s[2] for s in valid_empty_slots]
     memory_block = get_memory_context()
+    qty_desc = format_qty_summary(box_qty, pcs_per_box)
 
     try:
         client, active_model, status = get_ai_client_and_model()
         if not status.startswith("Offline"):
             prompt = (
                 f"Pilih TEPAT SATU kode rak terbaik untuk produk baru berikut dari daftar slot kosong yang tersedia.\n"
-                f"Produk: {sku} - {name} (Kategori: {cat}, Perputaran: {speed}, Catatan: {notes})\n"
+                f"Produk: {sku} - {name} (Kategori: {cat}, Jumlah: {qty_desc}, Perputaran: {speed}, Catatan: {notes})\n"
                 f"Slot kosong valid: {', '.join(candidate_codes)}\n"
                 f"{memory_block}\n\n"
                 f"Balas HANYA dengan kode rak (contoh: R01-L1) diikuti 1 kalimat alasan singkat."
@@ -238,25 +256,35 @@ with tab1:
         name = col2.text_input("Nama Produk (sesuai Jurnal)", placeholder="Contoh: Raket Badminton Yonex")
         cat = col3.text_input("Kategori Barang", placeholder="Contoh: Olahraga / Raket")
 
+        q_col1, q_col2, q_col3 = st.columns([1, 1, 2])
+        box_qty = q_col1.number_input("Jumlah Dus (Box)", min_value=1, value=1, step=1)
+        pcs_per_box_input = q_col2.number_input(
+            "Isi per Dus / Pcs (Opsional)",
+            min_value=0,
+            value=0,
+            step=1,
+            help="Biarkan 0 jika tidak perlu menghitung jumlah isi di dalam dus."
+        )
+        speed = q_col3.selectbox("Kecepatan Perputaran", [
+            "Fast-Moving (Laku Cepat)",
+            "Medium (Normal)",
+            "Slow-Moving (Lambat)",
+            "Berat / Besar (Bulky)"
+        ])
+
         auto_mode = st.checkbox(
             "🤖 Auto-Assign Lokasi Rak oleh AI (Otomatis pilih Baris & Lantai kosong sesuai zonasi & memori)",
             value=True
         )
 
-        col4, col5, col6, col7 = st.columns([1, 1, 1.5, 2])
+        col4, col5, col6 = st.columns([1, 1, 2.5])
         row_num = col4.selectbox("Baris (Manual)", list(range(1, 9)), format_func=lambda x: f"Baris {x:02d}")
         floor_num = col5.selectbox(
             "Lantai (Manual)",
             list(range(1, 7)),
             format_func=lambda x: f"Lantai {x} {'(Bawah)' if x == 1 else '(Atas)' if x == 6 else ''}"
         )
-        speed = col6.selectbox("Kecepatan Perputaran", [
-            "Fast-Moving (Laku Cepat)",
-            "Medium (Normal)",
-            "Slow-Moving (Lambat)",
-            "Berat / Besar (Bulky)"
-        ])
-        notes = col7.text_input("Catatan Fisik", placeholder="Contoh: Dus besar, butuh tangga jika lantai 5-6")
+        notes = col6.text_input("Catatan Fisik", placeholder="Contoh: Dus besar, butuh tangga jika lantai 5-6")
 
         st.divider()
         flex_expander = st.expander("🔓 15% Fleksibel: Opsi Pengecualian / Override Supervisor (Khusus Input Manual)")
@@ -267,62 +295,97 @@ with tab1:
         if st.form_submit_button("Simpan Lokasi Rak"):
             if not sku.strip():
                 st.warning("Harap isi Kode Produk Jurnal (SKU).")
-            elif auto_mode:
-                with st.spinner("🤖 AI sedang mencari & menetapkan slot rak terbaik..."):
-                    assigned_r, assigned_f, assign_msg = auto_assign_bin(
-                        sku.strip(), name.strip(), cat.strip(), speed, notes.strip()
-                    )
-                if assigned_r is None:
-                    st.error(f"⛔ **Gagal Auto-Assign:** {assign_msg}")
-                else:
-                    bin_code = f"R{assigned_r:02d}-L{assigned_f}"
-                    conn.execute(
-                        "INSERT OR REPLACE INTO bin_map VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (sku.strip(), name.strip(), cat.strip(), assigned_r, assigned_f, bin_code, speed, notes.strip())
-                    )
-                    conn.commit()
-                    log_activity("AUTO_ASSIGN_RAK", f"{sku.strip()} ({name.strip()}) -> {bin_code} | {assign_msg}")
-                    st.success(f"🤖 **Berhasil Auto-Assign:** `{sku.strip()}` → **{bin_code}** (Baris {assigned_r}, Lantai {assigned_f})\n\n_{assign_msg}_")
             else:
-                bin_code = f"R{row_num:02d}-L{floor_num}"
-                is_allowed, block_reason = validate_placement_against_rules(
-                    sku.strip(), name.strip(), cat.strip(), row_num, floor_num, speed, notes.strip()
-                )
+                pcs_val = int(pcs_per_box_input) if int(pcs_per_box_input) > 0 else None
+                qty_label = format_qty_summary(int(box_qty), pcs_val)
 
-                if not is_allowed and not allow_override:
-                    log_activity("DITOLAK_ZONASI", f"{sku.strip()} ({name.strip()}) ke {bin_code}: {block_reason}")
-                    st.error(
-                        f"⛔ **Penempatan Ditolak (85% Aturan Ketat):** {block_reason}\n\n"
-                        "💡 *Tip:* Centang **Auto-Assign Lokasi Rak oleh AI** di atas, atau buka **15% Fleksibel** jika ini kasus darurat."
-                    )
+                if auto_mode:
+                    with st.spinner("🤖 AI sedang mencari & menetapkan slot rak terbaik..."):
+                        assigned_r, assigned_f, assign_msg = auto_assign_bin(
+                            sku.strip(), name.strip(), cat.strip(), speed, notes.strip(), int(box_qty), pcs_val
+                        )
+                    if assigned_r is None:
+                        st.error(f"⛔ **Gagal Auto-Assign:** {assign_msg}")
+                    else:
+                        bin_code = f"R{assigned_r:02d}-L{assigned_f}"
+                        conn.execute(
+                            """INSERT OR REPLACE INTO bin_map
+                               (jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (sku.strip(), name.strip(), cat.strip(), assigned_r, assigned_f, bin_code, speed, notes.strip(), int(box_qty), pcs_val)
+                        )
+                        conn.commit()
+                        log_activity("AUTO_ASSIGN_RAK", f"{sku.strip()} ({name.strip()}, {qty_label}) -> {bin_code} | {assign_msg}")
+                        st.success(f"🤖 **Berhasil Auto-Assign:** `{sku.strip()}` ({qty_label}) → **{bin_code}** (Baris {assigned_r}, Lantai {assigned_f})\n\n_{assign_msg}_")
                 else:
-                    if not is_allowed and allow_override:
-                        if not override_reason.strip():
-                            st.warning("⚠️ Anda mencentang override, tetapi **Alasan Pengecualian** belum diisi!")
-                            st.stop()
-                        log_activity("OVERRIDE_ZONASI", f"OVERRIDE disetujui untuk {sku.strip()} ke {bin_code}. Alasan: {override_reason}")
-                        st.warning(f"⚠️ **Pengecualian 15% Diterapkan (Override):** Menyimpan ke {bin_code} meskipun melanggar zonasi. Alasan tercatat: *{override_reason}*")
-
-                    conn.execute(
-                        "INSERT OR REPLACE INTO bin_map VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (sku.strip(), name.strip(), cat.strip(), row_num, floor_num, bin_code, speed, notes.strip())
+                    bin_code = f"R{row_num:02d}-L{floor_num}"
+                    is_allowed, block_reason = validate_placement_against_rules(
+                        sku.strip(), name.strip(), cat.strip(), row_num, floor_num, speed, notes.strip()
                     )
-                    conn.commit()
-                    if is_allowed:
-                        log_activity("SIMPAN_RAK", f"{sku.strip()} ({name.strip()}) -> {bin_code}")
-                    st.success(f"Berhasil menyimpan: {sku.strip()} → **{bin_code}** (Baris {row_num}, Lantai {floor_num})")
 
-    df_bins = pd.read_sql_query("""
+                    if not is_allowed and not allow_override:
+                        log_activity("DITOLAK_ZONASI", f"{sku.strip()} ({name.strip()}) ke {bin_code}: {block_reason}")
+                        st.error(
+                            f"⛔ **Penempatan Ditolak (85% Aturan Ketat):** {block_reason}\n\n"
+                            "💡 *Tip:* Centang **Auto-Assign Lokasi Rak oleh AI** di atas, atau buka **15% Fleksibel** jika ini kasus darurat."
+                        )
+                    else:
+                        if not is_allowed and allow_override:
+                            if not override_reason.strip():
+                                st.warning("⚠️ Anda mencentang override, tetapi **Alasan Pengecualian** belum diisi!")
+                                st.stop()
+                            log_activity("OVERRIDE_ZONASI", f"OVERRIDE disetujui untuk {sku.strip()} ke {bin_code}. Alasan: {override_reason}")
+                            st.warning(f"⚠️ **Pengecualian 15% Diterapkan (Override):** Menyimpan ke {bin_code} meskipun melanggar zonasi. Alasan tercatat: *{override_reason}*")
+
+                        conn.execute(
+                            """INSERT OR REPLACE INTO bin_map
+                               (jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (sku.strip(), name.strip(), cat.strip(), row_num, floor_num, bin_code, speed, notes.strip(), int(box_qty), pcs_val)
+                        )
+                        conn.commit()
+                        if is_allowed:
+                            log_activity("SIMPAN_RAK", f"{sku.strip()} ({name.strip()}, {qty_label}) -> {bin_code}")
+                        st.success(f"Berhasil menyimpan: {sku.strip()} ({qty_label}) → **{bin_code}** (Baris {row_num}, Lantai {floor_num})")
+
+    raw_bins_df = pd.read_sql_query("""
         SELECT 
-            bin_location AS "Kode Rak",
-            jurnal_sku AS "Kode SKU Jurnal",
-            product_name AS "Nama Produk",
-            category AS "Kategori",
-            turnover_speed AS "Perputaran",
-            notes AS "Catatan"
+            bin_location,
+            jurnal_sku,
+            product_name,
+            category,
+            box_qty,
+            pcs_per_box,
+            turnover_speed,
+            notes
         FROM bin_map 
         ORDER BY row_num, floor_num
     """, conn)
+
+    if raw_bins_df.empty:
+        df_bins = pd.DataFrame(columns=[
+            "Kode Rak", "Kode SKU Jurnal", "Nama Produk", "Kategori",
+            "Jumlah Dus", "Isi / Dus", "Total Pcs", "Perputaran", "Catatan"
+        ])
+    else:
+        df_bins = pd.DataFrame({
+            "Kode Rak": raw_bins_df["bin_location"],
+            "Kode SKU Jurnal": raw_bins_df["jurnal_sku"],
+            "Nama Produk": raw_bins_df["product_name"],
+            "Kategori": raw_bins_df["category"],
+            "Jumlah Dus": raw_bins_df["box_qty"].fillna(1).astype(int),
+            "Isi / Dus": raw_bins_df["pcs_per_box"].apply(
+                lambda x: f"{int(x)} pcs" if pd.notna(x) and int(x) > 0 else "-"
+            ),
+            "Total Pcs": raw_bins_df.apply(
+                lambda r: f"{int(r['box_qty'] or 1) * int(r['pcs_per_box']):,} pcs".replace(",", ".")
+                if pd.notna(r["pcs_per_box"]) and int(r["pcs_per_box"]) > 0 else "-",
+                axis=1
+            ),
+            "Perputaran": raw_bins_df["turnover_speed"],
+            "Catatan": raw_bins_df["notes"]
+        })
+
     st.dataframe(df_bins, width="stretch")
 
     if not df_bins.empty:
@@ -341,7 +404,7 @@ with tab1:
 # --- TAB 2: PETA VISUAL RAK 8 BARIS x 6 LANTAI ---
 with tab2:
     st.subheader("Denah Keterisian Rak (Lantai 6 Paling Atas → Lantai 1 Paling Bawah)")
-    raw_df = pd.read_sql_query("SELECT row_num, floor_num, jurnal_sku, product_name FROM bin_map", conn)
+    raw_df = pd.read_sql_query("SELECT row_num, floor_num, jurnal_sku, product_name, box_qty FROM bin_map", conn)
     
     grid_data = {}
     for r in range(1, 9):
@@ -352,7 +415,10 @@ with tab2:
             if matches.empty:
                 grid_data[col_label].append(f"[Kosong] R{r:02d}-L{f}")
             else:
-                items = ", ".join(matches["jurnal_sku"].tolist())
+                items = ", ".join([
+                    f"{row['jurnal_sku']} ({int(row['box_qty'] or 1)} dus)"
+                    for _, row in matches.iterrows()
+                ])
                 grid_data[col_label].append(f"📦 {items}")
 
     grid_df = pd.DataFrame(grid_data, index=[f"Lantai {f}" for f in range(6, 0, -1)])
@@ -371,7 +437,7 @@ with tab3:
         p_col1, p_col2 = st.columns([3, 1])
         new_item_input = p_col1.text_input(
             "Deskripsi & Jumlah Barang Masuk:",
-            placeholder="Contoh: 15 dus sepatu roda inline skate, berat total 250kg",
+            placeholder="Contoh: 15 dus sepatu roda inline skate (isi 6 pcs/dus), berat total 250kg",
             key="quick_slotting_input"
         )
         predict_clicked = p_col2.button("Prediksi Slot Terbaik", width="stretch")
@@ -385,7 +451,7 @@ with tab3:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    chat_input_val = st.chat_input("Tanya lokasi barang, minta rekomendasi rak barang masuk, atau ketik 'Ingat: ...'")
+    chat_input_val = st.chat_input("Tanya lokasi barang, jumlah dus/pcs, minta rekomendasi rak, atau ketik 'Ingat: ...'")
 
     active_prompt = None
     if predict_clicked:
@@ -426,7 +492,7 @@ Zonasi wajib:
 - Slow-Moving / Bulky / Berat: Lantai 5-6 (L5-L6)
 
 Tugasmu:
-1. Jika pengguna menanyakan lokasi barang, stok, atau riwayat gudang, jawab singkat dan akurat berdasarkan DATA RAK dan RIWAYAT AKTIVITAS.
+1. Jika pengguna menanyakan lokasi barang, stok (jumlah dus/pcs), atau riwayat gudang, jawab singkat dan akurat berdasarkan DATA RAK dan RIWAYAT AKTIVITAS.
 2. Jika pengguna meminta rekomendasi/prediksi rak untuk barang baru masuk, patuhi aturan zonasi dan ATURAN GUDANG di bawah, pilih 1 Kode Rak kosong terbaik (format R0X-LX), dan berikan 2 alasan singkat dalam Bahasa Indonesia.
 
 {memory_block}
@@ -459,7 +525,7 @@ DATA RAK SAAT INI:
 with tab4:
     st.subheader("🛒 Pengambilan Barang (Picking) & Cetak Invoice / Surat Jalan")
     pick_df = pd.read_sql_query(
-        "SELECT jurnal_sku, product_name, category, row_num, floor_num, bin_location, notes FROM bin_map ORDER BY row_num, floor_num",
+        "SELECT jurnal_sku, product_name, category, row_num, floor_num, bin_location, notes, box_qty, pcs_per_box FROM bin_map ORDER BY row_num, floor_num",
         conn
     )
 
@@ -473,7 +539,8 @@ with tab4:
         picker_name = inv_col3.text_input("Nama Staf Pengambil / Picker", placeholder="Contoh: Budi")
 
         pick_df["label"] = pick_df.apply(
-            lambda r: f"[{r['bin_location']}] {r['jurnal_sku']} — {r['product_name']}", axis=1
+            lambda r: f"[{r['bin_location']}] {r['jurnal_sku']} — {r['product_name']} ({format_qty_summary(r['box_qty'], r['pcs_per_box'])})",
+            axis=1
         )
         selected_labels = st.multiselect(
             "Pilih Barang yang Akan Diambil dari Rak (Otomatis diurutkan sesuai jalur rak R01 → R08):",
@@ -482,31 +549,43 @@ with tab4:
 
         if selected_labels:
             selected_rows = pick_df[pick_df["label"].isin(selected_labels)].sort_values(by=["row_num", "floor_num"])
-            st.markdown("#### Detail Jumlah & Harga per Item")
+            st.markdown("#### Detail Jumlah Dus & Harga per Item")
 
             picked_items = []
             for idx, r in selected_rows.iterrows():
+                avail_boxes = int(r["box_qty"] or 1)
+                pcs_box = int(r["pcs_per_box"]) if pd.notna(r["pcs_per_box"]) and int(r["pcs_per_box"]) > 0 else 0
+                stock_hint = f"Stok: {format_qty_summary(avail_boxes, pcs_box)}"
+
                 c1, c2, c3, c4 = st.columns([2.5, 1, 1.5, 2])
-                c1.markdown(f"**{r['bin_location']}** | `{r['jurnal_sku']}`<br>{r['product_name']}", unsafe_allow_html=True)
-                qty = c2.number_input("Qty", min_value=1, value=1, step=1, key=f"qty_{r['jurnal_sku']}")
-                price = c3.number_input("Harga Satuan (Rp)", min_value=0, value=0, step=1000, key=f"price_{r['jurnal_sku']}")
+                c1.markdown(
+                    f"**{r['bin_location']}** | `{r['jurnal_sku']}`<br>{r['product_name']}<br><small>{stock_hint}</small>",
+                    unsafe_allow_html=True
+                )
+                qty_dus = c2.number_input("Ambil (Dus)", min_value=1, value=1, step=1, key=f"qty_{r['jurnal_sku']}")
+                price = c3.number_input("Harga / Dus (Rp)", min_value=0, value=0, step=1000, key=f"price_{r['jurnal_sku']}")
                 item_note = c4.text_input("Keterangan", value=r["notes"] if r["notes"] else "", key=f"note_{r['jurnal_sku']}")
+
+                total_pcs_picked = qty_dus * pcs_box if pcs_box > 0 else 0
 
                 picked_items.append({
                     "Kode Rak": r["bin_location"],
                     "Kode SKU": r["jurnal_sku"],
                     "Nama Produk": r["product_name"],
-                    "Qty": qty,
+                    "Ambil (Dus)": qty_dus,
+                    "Isi / Dus": f"{pcs_box} pcs" if pcs_box > 0 else "-",
+                    "Total Pcs": f"{total_pcs_picked:,} pcs".replace(",", ".") if total_pcs_picked > 0 else "-",
                     "Harga Satuan": price,
-                    "Subtotal": qty * price,
-                    "Keterangan": item_note
+                    "Subtotal": qty_dus * price,
+                    "Keterangan": item_note,
+                    "_avail_boxes": avail_boxes
                 })
 
             st.divider()
             opt_col1, opt_col2 = st.columns([2, 1])
-            clear_from_rack = opt_col1.checkbox(
-                "Kosongkan slot rak otomatis setelah invoice dibuat (jika stok barang tersebut habis diambil)",
-                value=False
+            update_stock_mode = opt_col1.checkbox(
+                "Potong stok dus di rak otomatis setelah invoice dibuat (hapus slot jika sisa dus = 0)",
+                value=True
             )
 
             if opt_col2.button("🧾 Buat & Tampilkan Invoice Siap Cetak", type="primary"):
@@ -514,14 +593,18 @@ with tab4:
                 grand_total = inv_items_df["Subtotal"].sum()
                 now_display = datetime.now().strftime("%d %B %Y, %H:%M WIB")
 
-                sku_summary = ", ".join([f"{x['Kode SKU']} ({x['Qty']}x dari {x['Kode Rak']})" for x in picked_items])
+                sku_summary = ", ".join([f"{x['Kode SKU']} ({x['Ambil (Dus)']} dus dari {x['Kode Rak']})" for x in picked_items])
                 log_activity("AMBIL_BARANG", f"{invoice_no} untuk '{customer_name or 'Umum'}': {sku_summary}")
 
-                if clear_from_rack:
+                if update_stock_mode:
                     for x in picked_items:
-                        conn.execute("DELETE FROM bin_map WHERE jurnal_sku = ?", (x["Kode SKU"],))
+                        remaining = x["_avail_boxes"] - x["Ambil (Dus)"]
+                        if remaining <= 0:
+                            conn.execute("DELETE FROM bin_map WHERE jurnal_sku = ?", (x["Kode SKU"],))
+                        else:
+                            conn.execute("UPDATE bin_map SET box_qty = ? WHERE jurnal_sku = ?", (remaining, x["Kode SKU"]))
                     conn.commit()
-                    log_activity("KOSONGKAN_RAK", f"Slot dikosongkan otomatis setelah picking {invoice_no}")
+                    log_activity("UPDATE_STOK_RAK", f"Stok rak diperbarui otomatis setelah picking {invoice_no}")
 
                 rows_html = ""
                 for i, item in enumerate(picked_items, start=1):
@@ -533,7 +616,9 @@ with tab4:
                         <td style="font-weight:bold; color:#0f172a;">{item['Kode Rak']}</td>
                         <td>{item['Kode SKU']}</td>
                         <td>{item['Nama Produk']}</td>
-                        <td style="text-align:center; font-weight:bold;">{item['Qty']}</td>
+                        <td style="text-align:center; font-weight:bold;">{item['Ambil (Dus)']} dus</td>
+                        <td style="text-align:center;">{item['Isi / Dus']}</td>
+                        <td style="text-align:center;">{item['Total Pcs']}</td>
                         <td style="text-align:right;">{harga_str}</td>
                         <td style="text-align:right;">{sub_str}</td>
                         <td>{item['Keterangan']}</td>
@@ -556,7 +641,7 @@ with tab4:
                         margin: 0;
                     }}
                     .invoice-box {{
-                        max-width: 820px;
+                        max-width: 880px;
                         margin: auto;
                         border: 1px solid #cbd5e1;
                         border-radius: 8px;
@@ -599,21 +684,21 @@ with tab4:
                     table {{
                         width: 100%;
                         border-collapse: collapse;
-                        font-size: 13px;
+                        font-size: 12.5px;
                     }}
                     th {{
                         background: #0f172a;
                         color: #ffffff;
-                        padding: 10px 8px;
+                        padding: 9px 7px;
                         text-align: left;
                     }}
                     td {{
                         border-bottom: 1px solid #e2e8f0;
-                        padding: 9px 8px;
+                        padding: 8px 7px;
                     }}
                     .total-row td {{
                         font-weight: 700;
-                        font-size: 14px;
+                        font-size: 13.5px;
                         border-top: 2px solid #0f172a;
                         background: #f8fafc;
                     }}
@@ -654,7 +739,7 @@ with tab4:
                 </style>
                 </head>
                 <body>
-                    <div class="no-print" style="text-align:right; max-width:820px; margin:auto;">
+                    <div class="no-print" style="text-align:right; max-width:880px; margin:auto;">
                         <button class="print-btn" onclick="window.print()">🖨️ Cetak Invoice / Simpan PDF</button>
                     </div>
                     <div class="invoice-box">
@@ -681,12 +766,14 @@ with tab4:
                         <table>
                             <thead>
                                 <tr>
-                                    <th style="text-align:center; width:36px;">No</th>
+                                    <th style="text-align:center; width:32px;">No</th>
                                     <th>Lokasi Rak</th>
                                     <th>Kode SKU</th>
                                     <th>Nama Produk</th>
-                                    <th style="text-align:center;">Qty</th>
-                                    <th style="text-align:right;">Harga Satuan</th>
+                                    <th style="text-align:center;">Jumlah Dus</th>
+                                    <th style="text-align:center;">Isi / Dus</th>
+                                    <th style="text-align:center;">Total Pcs</th>
+                                    <th style="text-align:right;">Harga / Dus</th>
                                     <th style="text-align:right;">Subtotal</th>
                                     <th>Keterangan</th>
                                 </tr>
@@ -695,7 +782,9 @@ with tab4:
                                 {rows_html}
                                 <tr class="total-row">
                                     <td colspan="4" style="text-align:right;">TOTAL KESELURUHAN</td>
-                                    <td style="text-align:center;">{inv_items_df['Qty'].sum()}</td>
+                                    <td style="text-align:center;">{inv_items_df['Ambil (Dus)'].sum()} dus</td>
+                                    <td></td>
+                                    <td></td>
                                     <td></td>
                                     <td style="text-align:right;">{total_str}</td>
                                     <td></td>
@@ -724,7 +813,8 @@ with tab4:
                 st.success(f"Invoice **{invoice_no}** berhasil dibuat! Klik tombol **🖨️ Cetak Invoice / Simpan PDF** di bawah ini.")
                 components.html(printable_html, height=620, scrolling=True)
 
-                csv_invoice = inv_items_df.to_csv(index=False).encode("utf-8")
+                export_df = inv_items_df.drop(columns=["_avail_boxes"])
+                csv_invoice = export_df.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     label="⬇️ Download Data Invoice (CSV)",
                     data=csv_invoice,
@@ -738,7 +828,7 @@ with tab5:
     st.markdown(
         "Unggah file **.xlsx** atau **.csv** dengan kolom wajib: "
         "`jurnal_sku`, `product_name`, `row_num` (1–8), dan `floor_num` (1–6). "
-        "Kolom opsional: `category`, `turnover_speed`, `notes`."
+        "Kolom opsional: `box_qty`, `pcs_per_box`, `category`, `turnover_speed`, `notes`."
     )
 
     template_df = pd.DataFrame([
@@ -748,6 +838,8 @@ with tab5:
             "category": "Kategori Umum",
             "row_num": 1,
             "floor_num": 1,
+            "box_qty": 10,
+            "pcs_per_box": 24,
             "turnover_speed": "Fast-Moving (Laku Cepat)",
             "notes": "Rak bawah"
         }
@@ -801,11 +893,15 @@ with tab5:
                             else "Medium (Normal)"
                         )
                         notes_val = str(row.get("notes", "")).strip() if pd.notna(row.get("notes")) else ""
+                        box_val = int(row["box_qty"]) if pd.notna(row.get("box_qty")) and int(row["box_qty"]) > 0 else 1
+                        pcs_val = int(row["pcs_per_box"]) if pd.notna(row.get("pcs_per_box")) and int(row["pcs_per_box"]) > 0 else None
                         bin_code = f"R{r_val:02d}-L{f_val}"
 
                         conn.execute(
-                            "INSERT OR REPLACE INTO bin_map VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                            (sku_val, name_val, cat_val, r_val, f_val, bin_code, speed_val, notes_val)
+                            """INSERT OR REPLACE INTO bin_map
+                               (jurnal_sku, product_name, category, row_num, floor_num, bin_location, turnover_speed, notes, box_qty, pcs_per_box)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (sku_val, name_val, cat_val, r_val, f_val, bin_code, speed_val, notes_val, box_val, pcs_val)
                         )
                         imported_count += 1
 
