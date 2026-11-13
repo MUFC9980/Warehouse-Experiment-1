@@ -215,6 +215,9 @@ conn.execute("""
         turnover_speed TEXT,
         box_qty INTEGER,
         pcs_per_box INTEGER,
+        target_row INTEGER,
+        target_floor INTEGER,
+        target_bin TEXT,
         status TEXT,
         created_at TEXT,
         received_at TEXT,
@@ -223,6 +226,14 @@ conn.execute("""
         courier_notes TEXT
     )
 """)
+# Safe migration for stock_transfers pre-assigned target bin columns
+tr_cols = [row[1] for row in conn.execute("PRAGMA table_info(stock_transfers)").fetchall()]
+if "target_row" not in tr_cols:
+    conn.execute("ALTER TABLE stock_transfers ADD COLUMN target_row INTEGER")
+if "target_floor" not in tr_cols:
+    conn.execute("ALTER TABLE stock_transfers ADD COLUMN target_floor INTEGER")
+if "target_bin" not in tr_cols:
+    conn.execute("ALTER TABLE stock_transfers ADD COLUMN target_bin TEXT")
 
 conn.execute("""
     CREATE TABLE IF NOT EXISTS warehouse_memory (
@@ -241,7 +252,6 @@ conn.execute("""
         actor TEXT
     )
 """)
-# Safe migration for legacy databases missing the 'actor' column in activity_log
 act_cols = [row[1] for row in conn.execute("PRAGMA table_info(activity_log)").fetchall()]
 if "actor" not in act_cols:
     conn.execute("ALTER TABLE activity_log ADD COLUMN actor TEXT DEFAULT 'System'")
@@ -305,10 +315,6 @@ def get_warehouse_stats(warehouse: str | None = None) -> dict:
 
 # --- DEMAND & TRANSFER INTELLIGENCE ENGINE ---
 def compute_jakarta_transfer_recommendations() -> pd.DataFrame:
-    """
-    Learns Jakarta's 30-day sales velocity from outbound_sales and compares against
-    Jakarta's current stock + Surabaya's available surplus + active in-transit transfers.
-    """
     cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     
     sales_df = pd.read_sql_query("""
@@ -424,7 +430,7 @@ def search_inventory_for_ai(query_text: str, limit: int = 30) -> str:
         f"- SURABAYA: {sby['total_skus']:,} SKU | {sby['total_boxes']:,} Dus | {sby['occupied_bins']}/48 Slot Terisi.\n"
         f"- JAKARTA: {jkt['total_skus']:,} SKU | {jkt['total_boxes']:,} Dus | {jkt['occupied_bins']}/48 Slot Terisi.\n"
         f"- TOKO ANEKA (Store Transfer Log): Total {int(aneka_sent_cnt):,} Dus tercatat pernah ditransfer ke Toko Aneka.\n"
-        f"- IN-TRANSIT (SBY / JKT / Toko Aneka): {int(in_transit_cnt):,} Dus sedang dalam perjalanan."
+        f"- IN-TRANSIT (SBY / JKT / Toko Aneka): {int(in_transit_cnt):,} Dus sedang dalam perjalanan (sudah auto-input ke rak tujuan, menunggu final check)."
     ).replace(",", ".")
 
     rec_df = compute_jakarta_transfer_recommendations()
@@ -603,6 +609,25 @@ def auto_assign_bin(
     _, _, best_r, best_f, best_code = top_candidates[0]
     return best_r, best_f, f"Otomatis ke slot paling longgar di {warehouse} ({best_code})."
 
+def preassign_destination_bin(
+    dest_wh: str, sku: str, name: str, cat: str, speed: str, box_qty: int, pcs_per_box: int | None
+) -> tuple[int, int, str, str]:
+    """
+    Determines the exact rack slot in the destination warehouse (Surabaya or Jakarta)
+    the moment a transfer is dispatched, so it is auto-inputted and ready for final check.
+    """
+    existing = conn.execute(
+        "SELECT row_num, floor_num, bin_location FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?",
+        (dest_wh, sku)
+    ).fetchone()
+    if existing:
+        return int(existing[0]), int(existing[1]), existing[2], "Gabung ke rak existing"
+
+    ar, af, msg = auto_assign_bin(dest_wh, sku, name, cat, speed, "", box_qty, pcs_per_box)
+    ar = ar or 1
+    af = af or 3
+    return ar, af, f"R{ar:02d}-L{af}", msg
+
 # --- HELPER RENDERER FOR TAB 1 WAREHOUSE INPUT ---
 def render_warehouse_input_form(warehouse_name: str):
     wh_key = warehouse_name.lower()
@@ -715,13 +740,20 @@ def render_warehouse_input_form(warehouse_name: str):
             st.session_state.pending_force_override = None
             st.rerun()
 
-# --- HELPER RENDERER FOR 8x6 WAREHOUSE MAP ---
+# --- HELPER RENDERER FOR 8x6 WAREHOUSE MAP (INCLUDES PRE-ASSIGNED IN-TRANSIT) ---
 def render_warehouse_grid(warehouse_name: str):
     agg_df = pd.read_sql_query(
         "SELECT row_num, floor_num, COUNT(*) AS sku_cnt, COALESCE(SUM(box_qty), 0) AS total_dus FROM bin_map WHERE warehouse = ? GROUP BY row_num, floor_num",
         conn, params=[warehouse_name]
     )
     slot_lookup = {(int(r["row_num"]), int(r["floor_num"])): (int(r["sku_cnt"]), int(r["total_dus"])) for _, r in agg_df.iterrows()}
+
+    # Also show pre-assigned In-Transit incoming boxes reserved on each slot
+    incoming_df = pd.read_sql_query(
+        "SELECT target_row, target_floor, COALESCE(SUM(box_qty), 0) AS incoming_dus FROM stock_transfers WHERE to_warehouse = ? AND status = 'In-Transit' AND target_row IS NOT NULL GROUP BY target_row, target_floor",
+        conn, params=[warehouse_name]
+    )
+    incoming_lookup = {(int(r["target_row"]), int(r["target_floor"])): int(r["incoming_dus"]) for _, r in incoming_df.iterrows()}
     
     grid_data = {}
     for r in range(1, 9):
@@ -729,7 +761,15 @@ def render_warehouse_grid(warehouse_name: str):
         grid_data[col_lbl] = []
         for f in range(6, 0, -1):
             s_cnt, d_cnt = slot_lookup.get((r, f), (0, 0))
-            grid_data[col_lbl].append(f"[Kosong] R{r:02d}-L{f}" if s_cnt == 0 else f"📦 {s_cnt} SKU ({d_cnt} dus)")
+            inc_cnt = incoming_lookup.get((r, f), 0)
+            if s_cnt == 0 and inc_cnt == 0:
+                grid_data[col_lbl].append(f"[Kosong] R{r:02d}-L{f}")
+            elif s_cnt == 0 and inc_cnt > 0:
+                grid_data[col_lbl].append(f"⏳ +{inc_cnt} dus (In-Transit)")
+            elif inc_cnt > 0:
+                grid_data[col_lbl].append(f"📦 {s_cnt} SKU ({d_cnt} dus | ⏳+{inc_cnt})")
+            else:
+                grid_data[col_lbl].append(f"📦 {s_cnt} SKU ({d_cnt} dus)")
     st.dataframe(pd.DataFrame(grid_data, index=[f"Lantai {f}" for f in range(6, 0, -1)]), width="stretch", height=240)
 
 # --- 3. STREAMLIT APP & UI ---
@@ -752,7 +792,7 @@ st.caption(
     f"Zonasi 85% • 15% Fleksibel | "
     f"**Surabaya:** {sby_stats['total_skus']:,} SKU ({sby_stats['occupied_bins']}/48 Slot) • "
     f"**Jakarta:** {jkt_stats['total_skus']:,} SKU ({jkt_stats['occupied_bins']}/48 Slot) • "
-    f"**In-Transit:** {int(in_transit_total):,} Dus"
+    f"**In-Transit (Auto-Input):** {int(in_transit_total):,} Dus"
 )
 
 if "tab6_unlocked" not in st.session_state:
@@ -765,7 +805,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "2. Peta Rak & Audit",
     "3. Asisten AI",
     "4. Picking & Invoice",
-    "5. 🚚 Transfer & Toko Aneka",
+    "5. 🚚 Transfer & Final Check",
     "6. Reorder & Demand ⚠️",
     "7. FIFO & Expiry ⏳",
     "8. Import Excel",
@@ -784,6 +824,7 @@ with tab1:
 # --- TAB 2: PETA RAK & CYCLE COUNTING AUDIT MODE (SURABAYA & JAKARTA ONLY) ---
 with tab2:
     st.subheader("Denah Rak (Surabaya & Jakarta) & Cycle Counting Audit")
+    st.caption("Slot bertanda `⏳ +X dus` menunjukkan kiriman transfer yang sudah otomatis dialokasikan sistem dan sedang menunggu **Final Check** fisik.")
     
     map_sby, map_jkt = st.tabs(["🗺️ Peta Rak Surabaya", "🗺️ Peta Rak Jakarta"])
     with map_sby:
@@ -845,7 +886,7 @@ with tab3:
         sys_prompt = (
             f"Asisten Kepala Gudang untuk cabang Surabaya dan Jakarta (masing-masing 8 Baris x 6 Lantai) serta pencatatan transfer ke Toko Aneka (toko retail tanpa sistem rak 8x6). "
             f"Zonasi gudang: Fast-Moving (L1-L2), Medium (L3-L4), Slow/Bulky (L5-L6). "
-            f"Anda juga memantau kecepatan penjualan Jakarta dan merekomendasikan transfer stok dari Surabaya ke Jakarta jika stok Jakarta menipis (<14 hari).\n"
+            f"Setiap pengiriman menuju Surabaya atau Jakarta otomatis dipilihkan rak tujuan oleh sistem saat dikirim, sehingga staf tujuan hanya perlu melakukan Final Check fisik.\n"
             f"{mem_block}\n\n{rel_inv}"
         )
         try:
@@ -905,10 +946,10 @@ with tab4:
                 log_activity("PICKING", f"[{pick_wh}] Picking {inv_no} oleh {picker} untuk {len(picked_items)} SKU", actor=picker)
                 st.success(f"Surat Jalan **{inv_no}** ({pick_wh}) berhasil diterbitkan! Data penjualan otomatis direkam untuk analisis AI.")
 
-# --- TAB 5: DEDICATED INTER-LOCATION TRANSFER TRACKER (SURABAYA <-> JAKARTA <-> TOKO ANEKA) ---
+# --- TAB 5: DEDICATED INTER-LOCATION TRANSFER TRACKER WITH AUTO-INPUT & FINAL CHECK ---
 with tab5:
-    st.subheader("🚚 Tracker Pengiriman Antar Gudang & Toko (Surabaya ↔ Jakarta ↔ Toko Aneka)")
-    st.caption("Catatan: **Toko Aneka** beroperasi sebagai toko retail ringan (hanya mencatat pengiriman keluar/masuk tanpa sistem peta rak 8×6).")
+    st.subheader("🚚 Tracker Transfer (Auto-Input Rak Tujuan & Final Check Staf)")
+    st.caption("Pengiriman menuju **Surabaya** atau **Jakarta** otomatis dialokasikan ke rak tujuan saat dikirim. Staf gudang tujuan cukup melakukan **Final Check** hitung fisik saat barang tiba.")
 
     smart_recs = compute_jakarta_transfer_recommendations()
     if not smart_recs.empty:
@@ -918,9 +959,9 @@ with tab5:
             st.dataframe(transferable[["SKU", "Produk", "Stok JKT", "In-Transit", "Terjual JKT (30h)", "Estimasi Habis", "Surplus SBY", "Saran Transfer"]], width="stretch")
 
     st.divider()
-    col_tr1, col_tr2 = st.columns([1.2, 1.8])
+    col_tr1, col_tr2 = st.columns([1.15, 1.85])
 
-    # LEFT: Create New Transfer Shipment
+    # LEFT: Create New Transfer Shipment (Auto-Input Destination Bin Immediately)
     with col_tr1:
         st.markdown("#### 📤 Buat Pengiriman / Transfer Baru")
         origin_loc = st.selectbox("Lokasi Pengirim", TRANSFER_LOCATIONS, key="tr_origin")
@@ -944,10 +985,11 @@ with tab5:
                 with st.form("create_transfer_wh_form"):
                     tr_qty = st.number_input("Jumlah Dus Dikirim", min_value=1, max_value=int(chosen_row["box_qty"]), value=1, step=1)
                     courier_info = st.text_input("Ekspedisi / No. Resi / Driver", placeholder="Contoh: Kurir Toko / Kalog / Resi #12345")
-                    if st.form_submit_button(f"🚚 Kirim ke {dest_loc} (Set In-Transit)", use_container_width=True):
+                    if st.form_submit_button(f"🚚 Kirim & Auto-Input ke {dest_loc}", use_container_width=True):
                         tr_id = f"TRF-{get_loc_code(origin_loc)}-{get_loc_code(dest_loc)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                         now_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
                         
+                        # Deduct from origin warehouse
                         rem_origin = int(chosen_row["box_qty"]) - int(tr_qty)
                         if rem_origin <= 0:
                             conn.execute("DELETE FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?", (origin_loc, chosen_row["jurnal_sku"]))
@@ -955,19 +997,31 @@ with tab5:
                             conn.execute("UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?", (rem_origin, origin_loc, chosen_row["jurnal_sku"]))
                         
                         pcs_box_val = int(chosen_row["pcs_per_box"]) if pd.notna(chosen_row["pcs_per_box"]) else None
+
+                        # Auto-input target rack slot if destination is Surabaya or Jakarta
+                        if dest_loc in WAREHOUSES:
+                            t_row, t_floor, t_bin, _ = preassign_destination_bin(
+                                dest_loc, chosen_row["jurnal_sku"], chosen_row["product_name"],
+                                chosen_row["category"] or "", chosen_row["turnover_speed"] or "Medium (Normal)",
+                                int(tr_qty), pcs_box_val
+                            )
+                        else:
+                            t_row, t_floor, t_bin = None, None, "Toko Aneka (Retail)"
+
                         conn.execute("""
                             INSERT INTO stock_transfers (
                                 transfer_id, from_warehouse, to_warehouse, jurnal_sku, product_name,
-                                category, turnover_speed, box_qty, pcs_per_box, status, created_at, sender, courier_notes
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'In-Transit', ?, ?, ?)
+                                category, turnover_speed, box_qty, pcs_per_box, target_row, target_floor, target_bin,
+                                status, created_at, sender, courier_notes
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'In-Transit', ?, ?, ?)
                         """, (
                             tr_id, origin_loc, dest_loc, chosen_row["jurnal_sku"], chosen_row["product_name"],
                             chosen_row["category"], chosen_row["turnover_speed"], int(tr_qty), pcs_box_val,
-                            now_ts, st.session_state.current_user, courier_info.strip()
+                            t_row, t_floor, t_bin, now_ts, st.session_state.current_user, courier_info.strip()
                         ))
                         conn.commit()
-                        log_activity("TRANSFER_SENT", f"{tr_id}: {tr_qty} dus {chosen_row['jurnal_sku']} ({origin_loc} -> {dest_loc})")
-                        st.success(f"Pengiriman **{tr_id}** tercatat In-Transit ke **{dest_loc}**!")
+                        log_activity("TRANSFER_SENT", f"{tr_id}: {tr_qty} dus {chosen_row['jurnal_sku']} ({origin_loc} -> {dest_loc} | Auto-Slot: {t_bin})")
+                        st.success(f"Dikirim (**{tr_id}**)! Sistem otomatis menyiapkan slot **{dest_loc} | {t_bin}** untuk Final Check.")
                         st.rerun()
 
         # Case B: Origin is Toko Aneka
@@ -979,101 +1033,130 @@ with tab5:
                 ank_speed = st.selectbox("Perputaran (untuk penempatan rak tujuan)", ["Medium (Normal)", "Fast-Moving (Laku Cepat)", "Slow-Moving (Lambat)", "Berat / Besar (Bulky)"])
                 ank_qty = st.number_input("Jumlah Dus Dikirim", min_value=1, value=1, step=1)
                 courier_info = st.text_input("Ekspedisi / Driver / Catatan", placeholder="Contoh: Driver Toko Aneka")
-                if st.form_submit_button(f"🚚 Kirim dari Toko Aneka ke {dest_loc}", use_container_width=True):
+                if st.form_submit_button(f"🚚 Kirim & Auto-Input ke {dest_loc}", use_container_width=True):
                     if not ank_sku.strip():
                         st.warning("Kode SKU wajib diisi.")
                     else:
                         tr_id = f"TRF-ANK-{get_loc_code(dest_loc)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                         now_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        t_row, t_floor, t_bin, _ = preassign_destination_bin(
+                            dest_loc, ank_sku.strip(), ank_name.strip() or ank_sku.strip(),
+                            "Toko Aneka", ank_speed, int(ank_qty), None
+                        )
                         conn.execute("""
                             INSERT INTO stock_transfers (
                                 transfer_id, from_warehouse, to_warehouse, jurnal_sku, product_name,
-                                category, turnover_speed, box_qty, pcs_per_box, status, created_at, sender, courier_notes
-                            ) VALUES (?, 'Toko Aneka', ?, ?, ?, 'Toko Aneka', ?, ?, NULL, 'In-Transit', ?, ?, ?)
+                                category, turnover_speed, box_qty, pcs_per_box, target_row, target_floor, target_bin,
+                                status, created_at, sender, courier_notes
+                            ) VALUES (?, 'Toko Aneka', ?, ?, ?, 'Toko Aneka', ?, ?, NULL, ?, ?, ?, 'In-Transit', ?, ?, ?)
                         """, (
                             tr_id, dest_loc, ank_sku.strip(), ank_name.strip() or ank_sku.strip(),
-                            ank_speed, int(ank_qty), now_ts, st.session_state.current_user, courier_info.strip()
+                            ank_speed, int(ank_qty), t_row, t_floor, t_bin, now_ts, st.session_state.current_user, courier_info.strip()
                         ))
                         conn.commit()
-                        log_activity("TRANSFER_SENT", f"{tr_id}: {ank_qty} dus {ank_sku.strip()} (Toko Aneka -> {dest_loc})")
-                        st.success(f"Pengiriman **{tr_id}** dari Toko Aneka tercatat In-Transit ke **{dest_loc}**!")
+                        log_activity("TRANSFER_SENT", f"{tr_id}: {ank_qty} dus {ank_sku.strip()} (Toko Aneka -> {dest_loc} | Auto-Slot: {t_bin})")
+                        st.success(f"Dikirim (**{tr_id}**)! Sistem otomatis menyiapkan slot **{dest_loc} | {t_bin}** untuk Final Check.")
                         st.rerun()
 
-    # RIGHT: Live In-Transit Tracker & Receive Confirmation
+    # RIGHT: Auto-Inputted Arrivals Queue (Final Physical Check by Employees)
     with col_tr2:
-        st.markdown("#### 🛰️ Status Barang Dalam Perjalanan (In-Transit)")
+        st.markdown("#### ✅ Antrean Barang Masuk (Auto-Input — Menunggu Final Check)")
         transit_list = pd.read_sql_query(
             "SELECT * FROM stock_transfers WHERE status = 'In-Transit' ORDER BY created_at DESC",
             conn
         )
         if transit_list.empty:
-            st.success("✅ Tidak ada barang yang tertahan di perjalanan. Semua transfer sudah diterima.")
+            st.success("✅ Semua pengiriman sudah melewati Final Check dan sah masuk ke stok rak.")
         else:
             for _, tr in transit_list.iterrows():
+                dest = tr["to_warehouse"]
+                expected_boxes = int(tr["box_qty"])
+                pre_bin = tr["target_bin"] if pd.notna(tr["target_bin"]) and tr["target_bin"] else "Auto-Assign"
+
                 with st.container(border=True):
-                    t_c1, t_c2 = st.columns([2.5, 1])
+                    t_c1, t_c2 = st.columns([2.2, 1.3])
                     with t_c1:
-                        st.markdown(f"**{tr['transfer_id']}** | `{tr['from_warehouse']}` ➡️ **`{tr['to_warehouse']}`**")
-                        st.write(f"📦 **{tr['jurnal_sku']}** — {tr['product_name']} (**{tr['box_qty']} dus**)")
+                        st.markdown(f"**{tr['transfer_id']}** | `{tr['from_warehouse']}` ➡️ **`{dest}`**")
+                        st.write(f"📦 **{tr['jurnal_sku']}** — {tr['product_name']} (**{expected_boxes} dus**)")
+                        if dest in WAREHOUSES:
+                            st.info(f"🤖 **Auto-Input Rak Tujuan:** `{dest} | {pre_bin}` (Siap letak setelah Final Check)")
                         st.caption(f"Dikirim: {tr['created_at']} oleh {tr['sender']} | Ekspedisi: {tr['courier_notes'] or '-'}")
+
                     with t_c2:
-                        if st.button(f"✅ Terima di {tr['to_warehouse']}", key=f"rcv_{tr['transfer_id']}", type="primary", use_container_width=True):
-                            dest = tr["to_warehouse"]
-                            sku_t = tr["jurnal_sku"]
-                            add_boxes = int(tr["box_qty"])
-                            now_rcv = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-                            if dest == "Toko Aneka":
+                        if dest == "Toko Aneka":
+                            if st.button("✅ Final Check Toko Aneka", key=f"rcv_{tr['transfer_id']}", type="primary", use_container_width=True):
+                                now_rcv = datetime.now().strftime("%Y-%m-%d %H:%M")
                                 conn.execute("""
                                     UPDATE stock_transfers
                                     SET status = 'Completed', received_at = ?, receiver = ?
                                     WHERE transfer_id = ?
                                 """, (now_rcv, st.session_state.current_user, tr["transfer_id"]))
                                 conn.commit()
-                                log_activity("TRANSFER_RECEIVED", f"{tr['transfer_id']} diterima di Toko Aneka ({add_boxes} dus {sku_t})")
-                                st.success(f"Diterima di **Toko Aneka** dan tercatat di log transfer!")
+                                log_activity("TRANSFER_RECEIVED", f"{tr['transfer_id']} Final Check selesai di Toko Aneka ({expected_boxes} dus {tr['jurnal_sku']})")
+                                st.success("Final Check Toko Aneka selesai!")
                                 st.rerun()
-                            else:
-                                existing_dest = conn.execute(
-                                    "SELECT row_num, floor_num, bin_location, box_qty FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?",
-                                    (dest, sku_t)
-                                ).fetchone()
+                        else:
+                            verified_qty = st.number_input(
+                                "Final Check Fisik (Dus)",
+                                min_value=0,
+                                value=expected_boxes,
+                                step=1,
+                                key=f"chk_qty_{tr['transfer_id']}"
+                            )
+                            if st.button(f"✅ Final Check & Sahkan ({pre_bin})", key=f"rcv_{tr['transfer_id']}", type="primary", use_container_width=True):
+                                sku_t = tr["jurnal_sku"]
+                                now_rcv = datetime.now().strftime("%Y-%m-%d %H:%M")
+                                diff = int(verified_qty) - expected_boxes
 
-                                if existing_dest:
-                                    new_total = int(existing_dest[3]) + add_boxes
-                                    conn.execute(
-                                        "UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?",
-                                        (new_total, dest, sku_t)
-                                    )
-                                    assigned_bin = existing_dest[2]
+                                if int(verified_qty) > 0:
+                                    existing_dest = conn.execute(
+                                        "SELECT row_num, floor_num, bin_location, box_qty FROM bin_map WHERE warehouse = ? AND jurnal_sku = ?",
+                                        (dest, sku_t)
+                                    ).fetchone()
+
+                                    if existing_dest:
+                                        new_total = int(existing_dest[3]) + int(verified_qty)
+                                        conn.execute(
+                                            "UPDATE bin_map SET box_qty = ? WHERE warehouse = ? AND jurnal_sku = ?",
+                                            (new_total, dest, sku_t)
+                                        )
+                                        final_bin = existing_dest[2]
+                                    else:
+                                        pcs_v = int(tr["pcs_per_box"]) if pd.notna(tr["pcs_per_box"]) else None
+                                        if pd.notna(tr["target_row"]) and pd.notna(tr["target_floor"]):
+                                            ar, af = int(tr["target_row"]), int(tr["target_floor"])
+                                        else:
+                                            ar, af, _, _ = preassign_destination_bin(
+                                                dest, sku_t, tr["product_name"], tr["category"] or "",
+                                                tr["turnover_speed"] or "Medium (Normal)", int(verified_qty), pcs_v
+                                            )
+                                        final_bin = f"R{ar:02d}-L{af}"
+                                        conn.execute("""
+                                            INSERT INTO bin_map (
+                                                warehouse, jurnal_sku, product_name, category, row_num, floor_num,
+                                                bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold
+                                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 3)
+                                        """, (
+                                            dest, sku_t, tr["product_name"], tr["category"] or "", ar, af,
+                                            final_bin, tr["turnover_speed"] or "Medium (Normal)",
+                                            f"Transfer dari {tr['from_warehouse']}", int(verified_qty), pcs_v
+                                        ))
                                 else:
-                                    pcs_v = int(tr["pcs_per_box"]) if pd.notna(tr["pcs_per_box"]) else None
-                                    ar, af, _ = auto_assign_bin(
-                                        dest, sku_t, tr["product_name"], tr["category"] or "",
-                                        tr["turnover_speed"] or "Medium (Normal)", "", add_boxes, pcs_v
-                                    )
-                                    ar = ar or 1
-                                    af = af or 3
-                                    assigned_bin = f"R{ar:02d}-L{af}"
-                                    conn.execute("""
-                                        INSERT INTO bin_map (
-                                            warehouse, jurnal_sku, product_name, category, row_num, floor_num,
-                                            bin_location, turnover_speed, notes, box_qty, pcs_per_box, min_box_threshold
-                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 3)
-                                    """, (
-                                        dest, sku_t, tr["product_name"], tr["category"] or "", ar, af,
-                                        assigned_bin, tr["turnover_speed"] or "Medium (Normal)",
-                                        f"Transfer dari {tr['from_warehouse']}", add_boxes, pcs_v
-                                    ))
+                                    final_bin = pre_bin
 
                                 conn.execute("""
                                     UPDATE stock_transfers
-                                    SET status = 'Completed', received_at = ?, receiver = ?
+                                    SET status = 'Completed', box_qty = ?, received_at = ?, receiver = ?
                                     WHERE transfer_id = ?
-                                """, (now_rcv, st.session_state.current_user, tr["transfer_id"]))
+                                """, (int(verified_qty), now_rcv, st.session_state.current_user, tr["transfer_id"]))
                                 conn.commit()
-                                log_activity("TRANSFER_RECEIVED", f"{tr['transfer_id']} diterima di {dest} -> Rak {assigned_bin}")
-                                st.success(f"Diterima! Masuk ke Rak **{dest} | {assigned_bin}**")
+
+                                if diff == 0:
+                                    log_activity("TRANSFER_RECEIVED", f"{tr['transfer_id']} Final Check OK ({verified_qty} dus) -> {dest} | {final_bin}")
+                                    st.success(f"Final Check OK! Sah masuk ke **{dest} | {final_bin}**")
+                                else:
+                                    log_activity("TRANSFER_RECEIVED", f"⚠️ {tr['transfer_id']} Final Check SELISIH ({verified_qty}/{expected_boxes} dus, {diff:+d}) -> {dest} | {final_bin}")
+                                    st.warning(f"Final Check tersimpan dengan selisih {diff:+d} dus di **{dest} | {final_bin}**.")
                                 st.rerun()
 
         st.divider()
@@ -1082,15 +1165,15 @@ with tab5:
         if filter_loc == "Semua Lokasi":
             completed_df = pd.read_sql_query("""
                 SELECT transfer_id AS 'No. Transfer', from_warehouse AS 'Dari', to_warehouse AS 'Ke',
-                       jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus',
-                       created_at AS 'Tgl Kirim', received_at AS 'Tgl Terima', receiver AS 'Penerima'
+                       target_bin AS 'Rak Tujuan', jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus Sah',
+                       created_at AS 'Tgl Kirim', received_at AS 'Tgl Final Check', receiver AS 'Checker'
                 FROM stock_transfers WHERE status = 'Completed' ORDER BY received_at DESC LIMIT 50
             """, conn)
         else:
             completed_df = pd.read_sql_query("""
                 SELECT transfer_id AS 'No. Transfer', from_warehouse AS 'Dari', to_warehouse AS 'Ke',
-                       jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus',
-                       created_at AS 'Tgl Kirim', received_at AS 'Tgl Terima', receiver AS 'Penerima'
+                       target_bin AS 'Rak Tujuan', jurnal_sku AS 'SKU', product_name AS 'Produk', box_qty AS 'Dus Sah',
+                       created_at AS 'Tgl Kirim', received_at AS 'Tgl Final Check', receiver AS 'Checker'
                 FROM stock_transfers
                 WHERE status = 'Completed' AND (from_warehouse = ? OR to_warehouse = ?)
                 ORDER BY received_at DESC LIMIT 50
@@ -1240,7 +1323,6 @@ with tab10:
 
         st.divider()
 
-        # Filters for Account, Action Type, and Keyword
         f_col1, f_col2, f_col3 = st.columns([1.2, 1.2, 1.6])
         known_actors = ["Semua Akun"] + sorted(all_logs_df["actor"].dropna().unique().tolist())
         selected_actor = f_col1.selectbox("Filter Akun Staf", known_actors, key="notif_actor_filter")
@@ -1249,8 +1331,8 @@ with tab10:
             "AUTO_ASSIGN": "🤖 Auto-Assign Rak",
             "SIMPAN_RAK": "📥 Input Manual Rak",
             "PICKING": "🛒 Picking / Surat Jalan",
-            "TRANSFER_SENT": "🚚 Kirim Transfer",
-            "TRANSFER_RECEIVED": "✅ Terima Transfer",
+            "TRANSFER_SENT": "🚚 Kirim Transfer (Auto-Input)",
+            "TRANSFER_RECEIVED": "✅ Final Check Transfer Selesai",
             "CYCLE_COUNT_AUDIT": "🔄 Cycle Count Audit",
             "OVERRIDE_APPROVED": "🔐 Override Disetujui",
             "FORCE_OVERRIDE": "⚠️ Force Override Supervisor",
